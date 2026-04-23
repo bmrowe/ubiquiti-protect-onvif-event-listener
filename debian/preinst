@@ -1,0 +1,17 @@
+#!/bin/sh
+# Pre-install script for onvif-recorder.
+# Stops the legacy manually-installed systemd unit (if present) before the
+# package installs files, so there's no window where two copies race.
+set -e
+
+if [ "$1" = "install" ] || [ "$1" = "upgrade" ]; then
+    if [ -f /etc/systemd/system/onvif-recorder.service ] \
+       && [ ! -L /etc/systemd/system/onvif-recorder.service ]; then
+        # Pre-package manual install: unit file is a real file in /etc/systemd/system.
+        systemctl stop onvif-recorder.service 2>/dev/null || true
+        systemctl disable onvif-recorder.service 2>/dev/null || true
+        # Don't delete yet — postinst handles removal once new files are in place.
+    fi
+fi
+
+exit 0

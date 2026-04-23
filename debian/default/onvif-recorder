@@ -1,0 +1,7 @@
+# Flags passed to /usr/bin/onvif-recorder at service startup.
+# See `/usr/bin/onvif-recorder --help` for the full list.
+#
+# Examples:
+#   ONVIF_RECORDER_FLAGS="--verbose"
+#   ONVIF_RECORDER_FLAGS="--detect_override --first_party_camera_models=G4,G5"
+ONVIF_RECORDER_FLAGS=""

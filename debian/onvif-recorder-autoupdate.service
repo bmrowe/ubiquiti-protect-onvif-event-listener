@@ -1,0 +1,10 @@
+[Unit]
+Description=Auto-install onvif-recorder updates
+Documentation=https://github.com/danielwoz/ubiquiti-protect-onvif-event-listener
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/apt-get update -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/onvif-recorder.list -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0
+ExecStart=/usr/bin/apt-get install -y --only-upgrade onvif-recorder

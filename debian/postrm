@@ -1,0 +1,30 @@
+#!/bin/sh
+# Post-remove script for onvif-recorder.
+# `remove` cleans up runtime-created files; `purge` also removes configuration
+# and state directories.
+set -e
+
+case "$1" in
+    remove)
+        # Compat symlink — may have been created by postinst.
+        rm -f /usr/bin/onvif_recorder
+        systemctl daemon-reload 2>/dev/null || true
+        ;;
+    purge)
+        rm -f /usr/bin/onvif_recorder
+        rm -rf /etc/onvif-recorder
+        rm -rf /var/lib/onvif-recorder
+        rm -rf /etc/systemd/system/onvif-recorder-autoupdate.timer.d
+        rm -f /etc/apt/sources.list.d/onvif-recorder.list
+        rm -f /usr/share/keyrings/onvif-recorder-archive-keyring.gpg
+        systemctl daemon-reload 2>/dev/null || true
+        ;;
+    upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+    *)
+        echo "postrm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

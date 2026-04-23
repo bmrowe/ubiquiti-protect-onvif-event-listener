@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily auto-install of onvif-recorder updates
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=2h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

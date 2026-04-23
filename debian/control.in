@@ -1,0 +1,17 @@
+Package: onvif-recorder
+Version: @VERSION@
+Section: net
+Priority: optional
+Architecture: @ARCH@
+Maintainer: Daniel Williams <danielwoz@gmail.com>
+Depends: libc6, systemd, adduser, procps
+Recommends: unifi-protect
+Homepage: https://github.com/danielwoz/ubiquiti-protect-onvif-event-listener
+Description: ONVIF event recorder for UniFi Protect
+ Subscribes to ONVIF cameras, parses their motion/smart-detect events, and
+ records detection intervals into the UniFi Protect PostgreSQL database so
+ third-party cameras appear alongside first-party ones in the Protect UI.
+ .
+ Also polls first-party motion events, runs NanoDet-M object detection on
+ thumbnails, and triggers Protect automations (alarm sounds, recording rules)
+ on smart-detect hits.

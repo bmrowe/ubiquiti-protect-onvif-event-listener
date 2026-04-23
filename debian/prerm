@@ -1,0 +1,30 @@
+#!/bin/sh
+# Pre-remove script for onvif-recorder.
+# Stops the service, rolls back cameras-table changes, reverts UI and nginx
+# patches before the binary is deleted from disk.
+set -e
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        systemctl stop onvif-recorder.service 2>/dev/null || true
+        systemctl disable --now onvif-recorder-channel.timer 2>/dev/null || true
+        systemctl disable --now onvif-recorder-autoupdate.timer 2>/dev/null \
+            || true
+
+        # On removal (not upgrade), roll back DB changes + revert patches.
+        if [ "$1" = "remove" ]; then
+            if [ -x /usr/bin/onvif-recorder ]; then
+                /usr/bin/onvif-recorder --rollback=all 2>&1 | \
+                    systemd-cat -t onvif-recorder-rollback || true
+            fi
+        fi
+        ;;
+    failed-upgrade)
+        ;;
+    *)
+        echo "prerm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

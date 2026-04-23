@@ -87,9 +87,10 @@ ABSL_FLAG(int32_t, post_buffer_sec, 2,
 ABSL_FLAG(bool, verbose, false,
     "Enable verbose logging (INFO level): subscription lifecycle, "
     "events received, and renewals. Default logs errors only.");
-ABSL_FLAG(std::string, model_dir, "/root/models",
+ABSL_FLAG(std::string, model_dir, "/usr/share/onvif-recorder/models",
     "Directory containing nanodet_m.param and nanodet_m.bin. "
-    "Models are downloaded automatically if not present.");
+    "Models are shipped in the Debian package at this path; if missing, "
+    "they are downloaded automatically.");
 ABSL_FLAG(std::string, state_dir, "/var/lib/onvif-recorder",
     "Directory for persistent runtime state (API-key cache, etc.). "
     "Created on first run if missing.");

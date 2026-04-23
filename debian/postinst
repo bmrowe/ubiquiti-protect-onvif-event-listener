@@ -1,0 +1,90 @@
+#!/bin/sh
+# Post-install script for onvif-recorder.
+# Migrates from the pre-package /root/* layout, installs the APT source for
+# the detected Protect channel, and enables the systemd units.
+set -e
+
+LEGACY_BIN=/root/onvif_recorder
+LEGACY_BIN_BAK=/root/onvif_recorder.bak
+LEGACY_BIN_NEW=/root/onvif_recorder.new
+LEGACY_LOG=/var/log/onvif-recorder.log
+LEGACY_API_KEY=/root/.config/onvif-recorder-api-key
+LEGACY_MODELS_DIR=/root/models
+LEGACY_UNIT=/etc/systemd/system/onvif-recorder.service
+
+STATE_DIR=/var/lib/onvif-recorder
+MODELS_DIR=/usr/share/onvif-recorder/models
+
+case "$1" in
+    configure)
+        # ----- Migrate API-key cache -----
+        if [ -f "$LEGACY_API_KEY" ]; then
+            mkdir -p "$STATE_DIR"
+            if [ ! -f "$STATE_DIR/protect-user-id" ]; then
+                cp "$LEGACY_API_KEY" "$STATE_DIR/protect-user-id"
+                chmod 600 "$STATE_DIR/protect-user-id"
+            fi
+            rm -f "$LEGACY_API_KEY"
+            rmdir /root/.config 2>/dev/null || true
+        fi
+
+        # ----- Migrate model files if package didn't ship them -----
+        if [ -d "$LEGACY_MODELS_DIR" ]; then
+            if [ ! -f "$MODELS_DIR/nanodet_m.bin" ] && \
+               [ -f "$LEGACY_MODELS_DIR/nanodet_m.bin" ]; then
+                mkdir -p "$MODELS_DIR"
+                cp "$LEGACY_MODELS_DIR/nanodet_m.param" "$MODELS_DIR/" \
+                    2>/dev/null || true
+                cp "$LEGACY_MODELS_DIR/nanodet_m.bin"   "$MODELS_DIR/" \
+                    2>/dev/null || true
+            fi
+            rm -rf "$LEGACY_MODELS_DIR"
+        fi
+
+        # ----- Remove legacy files (package owns these paths now) -----
+        # Only remove the unit if it's a plain file (not a symlink into our
+        # package's unit), and only if it still contains the old ExecStart.
+        if [ -f "$LEGACY_UNIT" ] && [ ! -L "$LEGACY_UNIT" ]; then
+            if grep -q '^ExecStart=/root/onvif_recorder' "$LEGACY_UNIT" \
+                2>/dev/null; then
+                rm -f "$LEGACY_UNIT"
+            fi
+        fi
+        rm -f "$LEGACY_BIN" "$LEGACY_BIN_BAK" "$LEGACY_BIN_NEW"
+        rm -f "$LEGACY_LOG" "$LEGACY_LOG".* 2>/dev/null || true
+
+        # ----- Legacy compat symlink so old scripts that call onvif_recorder -----
+        # (underscore) keep working.
+        if [ ! -e /usr/bin/onvif_recorder ]; then
+            ln -sf onvif-recorder /usr/bin/onvif_recorder
+        fi
+
+        # ----- Create state dir -----
+        mkdir -p "$STATE_DIR"
+        chmod 700 "$STATE_DIR"
+
+        # ----- Ensure config dir + default channel exist -----
+        mkdir -p /etc/onvif-recorder
+        if [ ! -f /etc/onvif-recorder/channel ]; then
+            echo "stable" > /etc/onvif-recorder/channel
+        fi
+
+        # ----- Detect channel from Protect (best effort) + write APT source --
+        /usr/libexec/onvif-recorder/detect-channel.sh || true
+        /usr/libexec/onvif-recorder/install-apt-source.sh || true
+
+        # ----- Reload systemd + enable units -----
+        systemctl daemon-reload
+        systemctl enable --now onvif-recorder.service \
+                                onvif-recorder-channel.timer \
+                                onvif-recorder-autoupdate.timer
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

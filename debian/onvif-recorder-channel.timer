@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily sync of onvif-recorder APT channel with Protect release channel
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

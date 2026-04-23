@@ -6,11 +6,13 @@
 #   ./build-in-docker.sh --x86        # x86-64 only
 #   ./build-in-docker.sh --arm64      # ARM64 only
 #   ./build-in-docker.sh --test       # build x86-64 + run tests
+#   ./build-in-docker.sh --deb        # build ARM64 release + .deb package
 #   ./build-in-docker.sh --rebuild    # force rebuild of the Docker image
 #
 # Output binaries are written to dist/ in the project root:
-#   dist/onvif_recorder          x86-64 binary
-#   dist/onvif_recorder.arm64    ARM64 binary (for Dream Machine / NVR)
+#   dist/onvif_recorder                          x86-64 binary
+#   dist/onvif_recorder.arm64                    ARM64 binary (for Dream Machine / NVR)
+#   dist/onvif-recorder_<version>_arm64.deb      Debian package (with --deb)
 
 set -euo pipefail
 
@@ -27,12 +29,14 @@ BUILD_X86=true
 BUILD_ARM64=true
 RUN_TESTS=false
 REBUILD_IMAGE=false
+BUILD_DEB=false
 
 for arg in "$@"; do
     case "$arg" in
         --x86)     BUILD_ARM64=false ;;
         --arm64)   BUILD_X86=false; BUILD_ARM64=true ;;
         --test)    BUILD_X86=true; BUILD_ARM64=false; RUN_TESTS=true ;;
+        --deb)     BUILD_X86=false; BUILD_ARM64=true; BUILD_DEB=true ;;
         --rebuild) REBUILD_IMAGE=true ;;
         *) echo "Unknown argument: $arg" >&2; exit 1 ;;
     esac
@@ -67,6 +71,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     curl \
     git \
+    dpkg-dev \
+    fakeroot \
+    xz-utils \
+    binutils-aarch64-linux-gnu \
   && pip3 install --break-system-packages cpplint \
   && rm -rf /var/lib/apt/lists/*
 
@@ -119,14 +127,34 @@ if $RUN_TESTS; then
 fi
 
 if $BUILD_ARM64; then
-    CACHED_SHA=$(cat "$ARM64_BUILD_CACHE" 2>/dev/null || echo "")
-    if [ -n "$CURRENT_SHA" ] && [ "$CURRENT_SHA" = "$CACHED_SHA" ]; then
-        echo "==> ARM64 Docker build skipped (already built at $(git -C "$SCRIPT_DIR" log -1 --oneline 2>/dev/null || echo "$CURRENT_SHA"))"
-    else
-        echo "==> Building ARM64 binary ..."
-        run "arm64" "build --config=arm64 //:onvif_recorder \
+    if $BUILD_DEB; then
+        echo "==> Building ARM64 release binary (PGO + ThinLTO) ..."
+        run "arm64_release" "build --config=arm64_release //:onvif_recorder \
           && cp -f bazel-bin/onvif_recorder dist/onvif_recorder.arm64"
         echo "==> dist/onvif_recorder.arm64"
-        echo "$CURRENT_SHA" > "$ARM64_BUILD_CACHE"
+    else
+        CACHED_SHA=$(cat "$ARM64_BUILD_CACHE" 2>/dev/null || echo "")
+        if [ -n "$CURRENT_SHA" ] && [ "$CURRENT_SHA" = "$CACHED_SHA" ]; then
+            echo "==> ARM64 Docker build skipped (already built at $(git -C "$SCRIPT_DIR" log -1 --oneline 2>/dev/null || echo "$CURRENT_SHA"))"
+        else
+            echo "==> Building ARM64 binary ..."
+            run "arm64" "build --config=arm64 //:onvif_recorder \
+              && cp -f bazel-bin/onvif_recorder dist/onvif_recorder.arm64"
+            echo "==> dist/onvif_recorder.arm64"
+            echo "$CURRENT_SHA" > "$ARM64_BUILD_CACHE"
+        fi
     fi
+fi
+
+if $BUILD_DEB; then
+    # Compute version on the host (git inside docker trips "dubious ownership"
+    # on bind-mounted repos; strip the leading "v").
+    DEB_VERSION=$(git -C "$SCRIPT_DIR" describe --tags --dirty 2>/dev/null \
+                  | sed 's/^v//' || echo "0.0.0-dev")
+    echo "==> Assembling .deb (version=$DEB_VERSION) ..."
+    docker run --rm \
+        -v "$SCRIPT_DIR:/build" \
+        -w /build \
+        "$IMAGE" \
+        bash -c "scripts/build-deb.sh --arch=arm64 --binary=dist/onvif_recorder.arm64 --version=$DEB_VERSION"
 fi
