@@ -7,7 +7,11 @@ Wants=postgresql@14-protect.service
 [Service]
 Type=simple
 User=root
+# Shipped defaults (conffile; dpkg may prompt on upgrades if edited).
 EnvironmentFile=-/etc/default/onvif-recorder
+# User override (never shipped by the package; persists across upgrades).
+# Variables set here win because systemd loads files in declared order.
+EnvironmentFile=-/etc/default/onvif-recorder.local
 ExecStart=/usr/bin/onvif-recorder $ONVIF_RECORDER_FLAGS
 Restart=on-failure
 RestartSec=10

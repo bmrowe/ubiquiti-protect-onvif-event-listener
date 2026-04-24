@@ -592,9 +592,15 @@ int main(int argc, char* argv[]) {
   // First-party camera flag modification
   //   (opt-in via --first_party_cameras and/or --first_party_camera_models).
   // ----------------------------------------------------------------
+  // Scoped at function level so the same set of cameras can be fed to the
+  // motion poller below.  Otherwise flipping `hasSmartDetect=true` via
+  // enable_smart_detect would make these cameras invisible to
+  // load_all_nonsmartdetect_first_party, and they'd get flagged as
+  // smart-capable in the UI without any software actually classifying
+  // their events.
+  std::vector<unifi::FirstPartyCamera> fp_cams;
   {
     // Collect cameras from explicit IDs.
-    std::vector<unifi::FirstPartyCamera> fp_cams;
     if (!fp_camera_ids.empty()) {
       auto fp_or = unifi::load_first_party_cameras(fp_camera_ids, cam_db);
       if (!fp_or.ok()) {
@@ -659,24 +665,43 @@ int main(int argc, char* argv[]) {
   }
 
   // ----------------------------------------------------------------
-  // Auto-discover first-party cameras for motion polling.
+  // First-party camera motion polling.
+  //
+  // Watch list is the union of:
+  //   - cameras auto-discovered as not having smart detect (genuine
+  //     motion-only models), and
+  //   - cameras forced via --first_party_cameras / --first_party_camera_models
+  //     above, which now carry hasSmartDetect=true but still need our
+  //     software to classify their events.
   // ----------------------------------------------------------------
   std::unique_ptr<onvif::MotionPoller> motion_poller;
   {
+    std::vector<std::string> fp_ids;
+    std::map<std::string, std::string> fp_macs;
+    std::set<std::string> seen;
+
+    auto add_camera = [&](const std::string& id,
+                          const std::string& name,
+                          const std::string& mac) {
+      if (id.empty() || !seen.insert(id).second) return;
+      fp_ids.push_back(id);
+      if (!mac.empty()) fp_macs[id] = mac;
+      LOG(INFO) << "[motion_poller]   " << id << " (" << name << ")";
+    };
+
+    for (const auto& c : fp_cams) add_camera(c.id, c.name, c.mac);
+
     auto fp_all_or = unifi::load_all_nonsmartdetect_first_party(cam_db);
-    if (fp_all_or.ok() && !fp_all_or->empty() && detector) {
-      const auto& fp_all = *fp_all_or;
-      LOG(INFO) << "[motion_poller] discovered " << fp_all.size()
-                << " first-party camera(s) without smart detection";
+    if (fp_all_or.ok()) {
+      for (const auto& c : *fp_all_or) add_camera(c.id, c.name, c.mac);
+    } else {
+      LOG(WARNING) << "[motion_poller] "
+                   << fp_all_or.status().message();
+    }
 
-      std::vector<std::string> fp_ids;
-      std::map<std::string, std::string> fp_macs;
-      for (const auto& c : fp_all) {
-        fp_ids.push_back(c.id);
-        if (!c.mac.empty()) fp_macs[c.id] = c.mac;
-        LOG(INFO) << "[motion_poller]   " << c.id << " (" << c.name << ")";
-      }
-
+    if (!fp_ids.empty() && detector) {
+      LOG(INFO) << "[motion_poller] watching " << fp_ids.size()
+                << " first-party camera(s)";
       auto mp_or = onvif::MotionPoller::Create(db_conn);
       if (mp_or.ok()) {
         motion_poller = std::move(*mp_or);
@@ -693,8 +718,8 @@ int main(int argc, char* argv[]) {
       } else {
         LOG(ERROR) << "[motion_poller] " << mp_or.status().message();
       }
-    } else if (fp_all_or.ok() && !fp_all_or->empty() && !detector) {
-      LOG(INFO) << "[motion_poller] " << fp_all_or->size()
+    } else if (!fp_ids.empty() && !detector) {
+      LOG(INFO) << "[motion_poller] " << fp_ids.size()
                 << " first-party camera(s) found but --detect/--model_dir "
                 << "not set; motion polling disabled";
     }

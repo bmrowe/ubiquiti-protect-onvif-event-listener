@@ -201,6 +201,7 @@ cc_library(
     deps = [
         "@com_google_absl//absl/log:log",
         "@com_google_absl//absl/status:status",
+        "@com_google_absl//absl/status:statusor",
     ],
 )
 
@@ -211,6 +212,7 @@ cc_test(
         ":protect_ui_patch_internal",
         "@com_google_absl//absl/log:log",
         "@com_google_absl//absl/status:status",
+        "@com_google_absl//absl/status:statusor",
     ],
 )
 

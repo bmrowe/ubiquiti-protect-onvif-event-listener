@@ -267,6 +267,83 @@ static void test_partial_patch() {
   std::remove((path + ".bak").c_str());
 }
 
+// ---------------------------------------------------------------
+// Test: nginx block injection places the block inside the server
+// block, not inside a previously-injected location block.
+// Regression for the v1.4.3/v1.4.4 bug where the admin-proxy block
+// got nested inside the log-viewer location, causing
+//   "location /onvif/admin/ is outside location /onvif/events/log"
+// on nginx -t.
+// ---------------------------------------------------------------
+static void test_nginx_inject_not_nested() {
+  static const char kBaseConf[] =
+    "server {\n"
+    "    listen 443 ssl http2 default_server;\n"
+    "    server_name _;\n"
+    "    include /usr/share/unifi-core/http/shared-post-setup-server.conf;\n"
+    "}\n";
+  static const char kLogBegin[] = "    # --- log begin ---\n";
+  static const char kLogEnd[]   = "    # --- log end ---\n";
+  static const char kAdminBegin[] = "    # --- admin begin ---\n";
+  static const char kAdminEnd[]   = "    # --- admin end ---\n";
+
+  const std::string log_block =
+    std::string(kLogBegin) +
+    "    location /onvif/events/log {\n"
+    "        proxy_pass http://127.0.0.1:7890/;\n"
+    "    }\n" +
+    kLogEnd;
+  const std::string admin_block =
+    std::string(kAdminBegin) +
+    "    location /onvif/admin/ {\n"
+    "        proxy_pass http://127.0.0.1:7891/;\n"
+    "    }\n" +
+    kAdminEnd;
+
+  // 1. Inject log block into a clean config.
+  auto c1 = protect_ui::inject_nginx_block_into(kBaseConf, log_block,
+                                                kLogBegin, kLogEnd);
+  check(c1.ok(), "1st inject ok");
+  check(c1->find("/onvif/events/log") != std::string::npos,
+        "1st inject placed log location");
+
+  // 2. Inject admin block into the already-patched config.  Previously,
+  //    find('}', s443) found the log location's '}' first, nesting admin
+  //    inside log.  The fixed finder should locate the server's '}'.
+  auto c2 = protect_ui::inject_nginx_block_into(*c1, admin_block,
+                                                kAdminBegin, kAdminEnd);
+  check(c2.ok(), "2nd inject ok");
+
+  const std::string& out = *c2;
+  size_t log_loc   = out.find("location /onvif/events/log {");
+  size_t log_close = out.find("    }\n", log_loc);
+  size_t admin_loc = out.find("location /onvif/admin/ {");
+  check(log_loc   != std::string::npos, "log location present");
+  check(log_close != std::string::npos, "log location closed");
+  check(admin_loc != std::string::npos, "admin location present");
+  check(admin_loc > log_close,
+        "admin location must be OUTSIDE (after) the log location's close");
+
+  // Overall brace balance must be consistent with the pre-inject
+  // brace balance (kBaseConf has depth 0 at the end).
+  int depth = 0;
+  for (char c : out) {
+    if (c == '{') ++depth;
+    else if (c == '}') --depth;
+  }
+  check(depth == 0, "config brace-balanced after inject");
+}
+
+// ---------------------------------------------------------------
+// Test: injection into a config without `listen 443` returns an error.
+// ---------------------------------------------------------------
+static void test_nginx_inject_no_server() {
+  static const char kNoServer[] = "# no server here\n";
+  auto r = protect_ui::inject_nginx_block_into(kNoServer, "block",
+                                               "# begin\n", "# end\n");
+  check(!r.ok(), "no listen 443 => error");
+}
+
 int main() {
   test_patch_lengths();
   test_apply_patches();
@@ -275,6 +352,8 @@ int main() {
   test_backend_patch();
   test_dpkg_backup_logic();
   test_partial_patch();
+  test_nginx_inject_not_nested();
+  test_nginx_inject_no_server();
 
   std::cout << "test_protect_ui_patch: "
             << g_pass << " passed, " << g_fail << " failed\n";

@@ -27,6 +27,7 @@
 
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 
 namespace protect_ui {
 
@@ -370,6 +371,49 @@ static bool strip_block(std::string* content,
   return true;
 }
 
+// Walk forward from the position of `listen 443` counting braces to find
+// the closing `}` of the enclosing `server { ... }` block.  We start at
+// depth=1 because the `listen` directive is already inside the opened
+// server block.  Returns std::string::npos if `listen 443` isn't in @p
+// content or the block is unbalanced.
+//
+// Naive content.find('}', s443) lands inside nested location blocks from
+// earlier injections, which breaks nginx config validity when a second
+// block is inserted later.
+static size_t find_server_close_brace(const std::string& content) {
+  size_t s443 = content.find("listen 443");
+  if (s443 == std::string::npos) return std::string::npos;
+  int depth = 1;
+  for (size_t i = s443; i < content.size(); ++i) {
+    char c = content[i];
+    if (c == '{') {
+      ++depth;
+    } else if (c == '}') {
+      if (--depth == 0) return i;
+    }
+  }
+  return std::string::npos;
+}
+
+// Returns @p content with any existing block bounded by begin/end removed,
+// and @p block inserted just before the closing `}` of the `listen 443`
+// server block.  Returns empty absl::StatusOr on structural failure.
+static absl::StatusOr<std::string> inject_nginx_block_into(
+    const std::string& content_in,
+    const std::string& block,
+    const char* begin,
+    const char* end) {
+  std::string content = content_in;
+  strip_block(&content, begin, end);
+  size_t brace = find_server_close_brace(content);
+  if (brace == std::string::npos) {
+    return absl::InternalError(
+        "cannot find closing brace for 443 server");
+  }
+  content.insert(brace, block);
+  return content;
+}
+
 // Shared: inject @p block just before the closing '}' of the `listen 443`
 // server block in site-local-ip.conf.  @p begin/@p end mark a pre-existing
 // copy to replace.  @p label is used for log messages.
@@ -384,30 +428,16 @@ static absl::Status inject_nginx_block(const std::string& block,
         "-- not running on a Dream Router/NVR?");
   }
 
-  strip_block(&content, begin, end);
+  auto new_content_or = inject_nginx_block_into(content, block, begin, end);
+  if (!new_content_or.ok()) return new_content_or.status();
+  const std::string& new_content = *new_content_or;
 
-  size_t s443 = content.find("listen 443");
-  if (s443 == std::string::npos) {
-    return absl::InternalError(
-        "cannot find 'listen 443' in nginx config");
-  }
-  size_t brace = content.find('}', s443);
-  if (brace == std::string::npos) {
-    return absl::InternalError(
-        "cannot find closing brace for 443 server");
+  if (new_content == content) {
+    LOG(INFO) << "[nginx] " << label << " block already present";
+    return absl::OkStatus();
   }
 
-  content.insert(brace, block);
-
-  {
-    std::string on_disk = read_file(kNginxConf);
-    if (on_disk == content) {
-      LOG(INFO) << "[nginx] " << label << " block already present";
-      return absl::OkStatus();
-    }
-  }
-
-  if (!write_file(kNginxConf, content)) {
+  if (!write_file(kNginxConf, new_content)) {
     return absl::InternalError("failed to write nginx config");
   }
   LOG(INFO) << "[nginx] injected " << label << " block";

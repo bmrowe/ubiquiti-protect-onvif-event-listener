@@ -1,7 +1,14 @@
 # Flags passed to /usr/bin/onvif-recorder at service startup.
 # See `/usr/bin/onvif-recorder --help` for the full list.
 #
-# Examples:
-#   ONVIF_RECORDER_FLAGS="--verbose"
-#   ONVIF_RECORDER_FLAGS="--detect_override --first_party_camera_models=G4,G5"
+# This file is a Debian conffile.  dpkg may prompt on package upgrades if
+# you edit it and the shipped version changes.  To keep local
+# customisations untouched across upgrades, put them in
+#   /etc/default/onvif-recorder.local
+# instead -- that path is never shipped by the package, and systemd
+# loads it AFTER this file so it always wins.
+#
+# Example /etc/default/onvif-recorder.local contents:
+#   ONVIF_RECORDER_FLAGS="--detect_override --verbose"
+#
 ONVIF_RECORDER_FLAGS=""
