@@ -20,7 +20,9 @@
       "Bash(find /usr/lib -name \"libpgcommon*.a\" -o -name \"libpgport*.a\" 2>/dev/null; dpkg -l \"postgresql-server-dev*\" 2>&1 | grep \"^ii\")",
       "Bash(nm -u /usr/lib/x86_64-linux-gnu/libcurl.a /usr/lib/x86_64-linux-gnu/libpq.a /usr/lib/x86_64-linux-gnu/libldap.a)",
       "Bash(nm -u /usr/lib/x86_64-linux-gnu/libpq.a)",
-      "Bash(dpkg -L libssh-dev 2>/dev/null | grep \"\\\\.a$\"\necho \"---\"\ndpkg -L libgnutls28-dev 2>/dev/null | grep \"\\\\.a$\"\necho \"---\" \ndpkg -L libp11-kit-dev 2>/dev/null | grep \"\\\\.a$\")"
+      "Bash(dpkg -L libssh-dev 2>/dev/null | grep \"\\\\.a$\"\necho \"---\"\ndpkg -L libgnutls28-dev 2>/dev/null | grep \"\\\\.a$\"\necho \"---\" \ndpkg -L libp11-kit-dev 2>/dev/null | grep \"\\\\.a$\")",
+      "Read(//home/danielwoz/**)",
+      "Bash(echo 'export HF_HOME=/mnt/cephfs/ai/huggingface')"
     ]
   }
 }
