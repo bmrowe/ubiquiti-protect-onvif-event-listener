@@ -1,0 +1,40 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Origin: onvif-recorder
+Label: onvif-recorder
+Suite: early-access
+Codename: early-access
+Version: 1.0
+Date: Sat, 25 Apr 2026 15:20:13 UTC
+Architectures: arm64
+Components: main
+Description: onvif-recorder early access channel
+MD5Sum:
+ 8fc6eb2a6af5ca9e0a2773bb63c4fe68 984 main/binary-arm64/Packages
+ 82e0bb6050778bff6026293dbc76a337 622 main/binary-arm64/Packages.gz
+ 076d60eae68e53d636c29cd37330ba67 165 main/binary-arm64/Release
+SHA1:
+ 148fc7343ec49b9054e64c82f29633879f04e0f4 984 main/binary-arm64/Packages
+ a88e7e20defde3a4de44a15374b9df8abc78032b 622 main/binary-arm64/Packages.gz
+ e5218f24dec7392e7a9f1d7b2817d01202470f1e 165 main/binary-arm64/Release
+SHA256:
+ 8d894c5533cde2b927076202c49ed54f083d375fc744177f924383c0a1470d8b 984 main/binary-arm64/Packages
+ 93d1605ae8bd61ff9ceea0924d3dc567226941434d97d41cbdb27fb0df19012d 622 main/binary-arm64/Packages.gz
+ 13bd0a78c3d0a20e054cd2668b26c2180bb3e246dfde6a3ef76e3392d023f8bb 165 main/binary-arm64/Release
+-----BEGIN PGP SIGNATURE-----
+
+iQIzBAEBCgAdFiEEppQhR+JB3iqGS85rXQujy8Eq0qIFAmns260ACgkQXQujy8Eq
+0qLafA//e0qs7H0RdJf2VuMfYZOZqGs6A1xFpcxNxwvuR45Yg0FhtgKxpgmRuOGu
+qcwv2Hku20Zhm4hnSrcAk38BIO44OUENPwAUdUuw7ErZD/79P+jsYL/aN9z5Pv0z
+1LbrE1ICmHs1vhdEux+++rdoyKX8NuzJgdJxkXzso5ZJzqRn6sBhXErtHi/vRq61
+ww3ww0Ot5eScR+2qmD6kIDG4LVeZmXRy08DeRx5MI5Q9DroCQaROIjdMf4fckGba
+dRhmSmiOvSBy4tVXQwtWnFjUr5LN7GKwWU5sKNkt7VqTTn1R8T5hzluhnFW5duYs
+52r8YCiIzoPid1bSk0Y1z4jxyhdJQvCnzJuCxNnRbYChVSSUZ5uzVrBQtJINbH0A
+FKiU9Sc8tBn5ifK11x01tuNz5DWpGYIyJy2JIfOpvav042bnNVGWGssqrdT3cOsf
+SMW4igHQU1kh9ezg3C3lymK20fqZcYShewiv8SCRpOR0kYKkGQktp7xzdB9szhRY
+YWjH5xozkkFfoZGWO29+3ow4ckwWu0JTd2skMXalNhINywNwM7E93Bw52dWQ2VFK
+GeuhZFw1LxP6YxNtpkeooNxK4y6BKS+lpbKuR8qpSTEf2wXVlS4+hZLMlMCjnPHl
+6qCZScDnIfKX2vAoghmNwb0sYBxmnor+tb1V3nEzaavcl8lNLWQ=
+=wUkQ
+-----END PGP SIGNATURE-----
