@@ -242,6 +242,29 @@ static int apply_patches(
 // Public API
 // ---------------------------------------------------------------
 absl::Status patch_alarm_picker() {
+  // Log the detected Protect firmware so a journal capture from a user
+  // running a brand-new firmware makes the version visible up-front.
+  // Fast popen path; failure is silent (we still proceed with patching).
+  {
+    std::string ver;
+    FILE* p = popen("dpkg-query -W -f='${Version}' "
+                    "unifi-protect 2>/dev/null", "r");  // NOLINT
+    if (p) {
+      char buf[64] = {0};
+      if (std::fgets(buf, sizeof(buf), p)) {
+        ver = buf;
+        while (!ver.empty() &&
+               (ver.back() == '\n' || ver.back() == ' '))
+          ver.pop_back();
+      }
+      pclose(p);  // NOLINT
+    }
+    if (!ver.empty())
+      LOG(INFO) << "[ui_patch] detected unifi-protect " << ver;
+    else
+      LOG(INFO) << "[ui_patch] unifi-protect version unknown";
+  }
+
   auto md5sums = load_dpkg_md5sums();
   int total = 0;
   int files_found = 0;

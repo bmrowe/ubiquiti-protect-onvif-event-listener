@@ -448,8 +448,15 @@ void AlarmNotifier::refresh_alarms() {
   if (response.empty()) return;
 
   auto parsed = parse_automations(response);
-  LOG(INFO) << "[alarm] loaded " << parsed.size()
-            << " automation(s) from Protect API";
+  if (parsed.empty()) {
+    LOG(WARNING) << "[alarm] loaded 0 automations from Protect API -- "
+                 << "no automations will fire on detections.  Open Protect "
+                 << "-> Alarms and create at least one enabled automation "
+                 << "with onvif-recorder cameras in scope.";
+  } else {
+    LOG(INFO) << "[alarm] loaded " << parsed.size()
+              << " automation(s) from Protect API";
+  }
   for (const auto& a : parsed) {
     LOG(INFO) << "[alarm]   " << a.id << " enabled=" << a.enabled
               << " types=" << a.trigger_types.size()

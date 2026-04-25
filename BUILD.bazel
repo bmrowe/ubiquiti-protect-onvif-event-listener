@@ -68,6 +68,7 @@ cc_library(
     strip_include_prefix = "src",
     deps = _MHD + [
         ":log_ring",
+        "@com_google_absl//absl/log:log",
     ],
 )
 

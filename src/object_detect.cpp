@@ -204,11 +204,31 @@ absl::StatusOr<std::unique_ptr<ObjectDetector>> ObjectDetector::Load(
 
   obj->impl_->net.opt.use_vulkan_compute = false;
 
-  if (obj->impl_->net.load_param(param_path.c_str()) != 0)
-    return absl::NotFoundError("object_detect: cannot load param: " +
+  // Distinguish "files missing" from "files present but failed to parse".
+  // The former usually means the .deb's models/ dir wasn't installed; the
+  // latter means the file is the wrong version or corrupted.
+  struct stat st{};
+  if (stat(param_path.c_str(), &st) != 0) {
+    LOG(ERROR) << "[detect] model param file missing: " << param_path;
+    return absl::NotFoundError("object_detect: param missing: " + param_path);
+  }
+  if (stat(bin_path.c_str(), &st) != 0) {
+    LOG(ERROR) << "[detect] model bin file missing: " << bin_path;
+    return absl::NotFoundError("object_detect: bin missing: " + bin_path);
+  }
+  if (obj->impl_->net.load_param(param_path.c_str()) != 0) {
+    LOG(ERROR) << "[detect] model param exists but ncnn rejected it: "
+               << param_path;
+    return absl::InternalError("object_detect: cannot load param: " +
                                param_path);
-  if (obj->impl_->net.load_model(bin_path.c_str()) != 0)
-    return absl::NotFoundError("object_detect: cannot load bin: " + bin_path);
+  }
+  if (obj->impl_->net.load_model(bin_path.c_str()) != 0) {
+    LOG(ERROR) << "[detect] model bin exists but ncnn rejected it: "
+               << bin_path;
+    return absl::InternalError("object_detect: cannot load bin: " + bin_path);
+  }
+  LOG(INFO) << "[detect] NanoDet-M model loaded ("
+            << param_path << " + " << bin_path << ")";
 
   return obj;
 #endif  // WITH_NCNN

@@ -926,6 +926,33 @@ DetectionRecorder::CreateWithBackend(std::unique_ptr<IDbBackend> backend) {
 
 DetectionRecorder::~DetectionRecorder() = default;
 
+void DetectionRecorder::maybe_emit_hourly_stats() {
+  constexpr uint64_t kWindowMs = 3600000ULL;  // 1 hour
+  uint64_t expected = stats_window_start_ms_.load();
+  const uint64_t now = util::now_ms();
+  if (expected == 0) {
+    // First call: initialise the window without emitting.
+    stats_window_start_ms_.compare_exchange_strong(expected, now);
+    return;
+  }
+  if (now - expected < kWindowMs) return;
+  // Try to take ownership of the emit; only one thread wins.
+  if (!stats_window_start_ms_.compare_exchange_strong(expected, now)) return;
+
+  const uint64_t events       = stats_events_.exchange(0);
+  const uint64_t coalesced    = stats_coalesced_.exchange(0);
+  const uint64_t rate_limited = stats_rate_limited_.exchange(0);
+  const uint64_t snapshots    = stats_snapshots_.exchange(0);
+  const uint64_t msr_ok       = stats_msr_ok_.exchange(0);
+  const uint64_t msr_fail     = stats_msr_fail_.exchange(0);
+  LOG(INFO) << "[recorder] last 1h: events=" << events
+            << " coalesced=" << coalesced
+            << " rate_limited=" << rate_limited
+            << " snapshots=" << snapshots
+            << " msr_ok=" << msr_ok
+            << " msr_fail=" << msr_fail;
+}
+
 void DetectionRecorder::set_snapshot(const CameraConfig& cam) {
   std::lock_guard<std::mutex> lk(mu_);
   snapshot_info_[cam.ip] = {cam.snapshot_url, cam.user, cam.password};
@@ -988,6 +1015,9 @@ void DetectionRecorder::set_ubv_dir(const std::string& dir) {
 }
 
 void DetectionRecorder::on_event(const OnvifEvent& ev) {
+  stats_events_.fetch_add(1);
+  maybe_emit_hourly_stats();
+
   // --- Per-camera capability tracking and basic-motion suppression ---
   // AI events (FieldDetector, HumanShapeDetect) mark the camera as AI-capable
   // so that subsequent CellMotionDetector events are suppressed.  This avoids
@@ -1076,9 +1106,12 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
         if (times.size() >= static_cast<std::size_t>(max_events_per_hour_)) {
           LOG(WARNING) << '[' << ev.camera_ip << "] rate limit ("
                        << max_events_per_hour_ << "/h): dropping detection";
+          stats_rate_limited_.fetch_add(1);
           return;
         }
       }
+      if (!coalesced_event_id.empty())
+        stats_coalesced_.fetch_add(1);
 
       auto it = snapshot_info_.find(ev.camera_ip);
       if (it != snapshot_info_.end()) {
@@ -1125,6 +1158,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
       } else {
         LOG(INFO) << '[' << ev.camera_ip << "] snapshot fetched: "
                   << snapshot.size() << " bytes";
+        stats_snapshots_.fetch_add(1);
       }
       // Crop snapshot.
       //   default (no detector):  ONVIF bbox → crop; no bbox → full image
@@ -1196,10 +1230,12 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
         stored_by_msr = true;
         LOG(INFO) << '[' << ev.camera_ip << "] MSR stored snapshot as id="
                   << msr_id;
+        stats_msr_ok_.fetch_add(1);
       } else {
         LOG(WARNING) << '[' << ev.camera_ip
                      << "] MSR StoreSnapshots failed; "
                      << "falling back to local thumbnail write";
+        stats_msr_fail_.fetch_add(1);
       }
     }
     if (thumb_id.empty()) {

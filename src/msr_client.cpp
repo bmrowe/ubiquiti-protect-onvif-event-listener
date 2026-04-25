@@ -264,19 +264,42 @@ std::string MsrClient::StoreSnapshot(const std::string& mac,
   curl_slist_free_all(headers);
   curl_easy_cleanup(curl);
 
+  // Connection-state diagnostics.  Five consecutive failures emit a single
+  // "suspended" warning; any subsequent success emits a single "resumed"
+  // (or first-success "connected") line and resets the counter.
+  constexpr int kSuspendThreshold = 5;
+  auto note_failure = [this]() {
+    int n = consecutive_failures_.fetch_add(1) + 1;
+    if (n == kSuspendThreshold && !suspended_.exchange(true)) {
+      LOG(WARNING) << "[msr] forwarding suspended after " << n
+                   << " consecutive failures to " << url_;
+    }
+  };
+  auto note_success = [this]() {
+    consecutive_failures_.store(0);
+    if (suspended_.exchange(false)) {
+      LOG(INFO) << "[msr] forwarding resumed: " << url_;
+    } else if (!seen_first_success_.exchange(true)) {
+      LOG(INFO) << "[msr] connected to " << url_;
+    }
+  };
+
   if (rc != CURLE_OK) {
     LOG(WARNING) << "MSR StoreSnapshots curl error: "
                  << curl_easy_strerror(rc) << " url=" << full_url;
+    note_failure();
     return "";
   }
   if (ctx.grpc_status != 0) {
     LOG(WARNING) << "MSR StoreSnapshots gRPC error: status="
                  << ctx.grpc_status << " msg=" << ctx.grpc_message;
+    note_failure();
     return "";
   }
   if (ctx.body.size() < 5) {
     LOG(WARNING) << "MSR StoreSnapshots short body: "
                  << ctx.body.size() << " bytes";
+    note_failure();
     return "";
   }
   // Skip the 5-byte gRPC length prefix on the inner message.
@@ -287,7 +310,10 @@ std::string MsrClient::StoreSnapshot(const std::string& mac,
   if (id.empty()) {
     LOG(WARNING) << "MSR StoreSnapshots: response parse returned no id ("
                  << msg_len << " bytes)";
+    note_failure();
+    return "";
   }
+  note_success();
   return id;
 }
 

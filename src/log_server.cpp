@@ -26,6 +26,8 @@ typedef int MHD_Result;
 #include <cstring>
 #include <string>
 
+#include "absl/log/log.h"
+
 #include "log_ring.hpp"
 
 // HTML template lives outside the namespace to avoid cpplint indent warnings.
@@ -143,13 +145,19 @@ bool LogServer::start(const LogRing* ring, uint16_t port) {
       MHD_OPTION_SOCK_ADDR,
       reinterpret_cast<struct sockaddr*>(&addr),
       MHD_OPTION_END);
-  return daemon_ != nullptr;
+  if (daemon_ != nullptr) {
+    LOG(INFO) << "[log_server] listening on 127.0.0.1:" << port;
+    return true;
+  }
+  LOG(WARNING) << "[log_server] failed to bind 127.0.0.1:" << port;
+  return false;
 }
 
 void LogServer::stop() {
   if (daemon_) {
     MHD_stop_daemon(daemon_);
     daemon_ = nullptr;
+    LOG(INFO) << "[log_server] stopped";
   }
 }
 

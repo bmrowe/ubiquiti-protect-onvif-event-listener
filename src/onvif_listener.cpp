@@ -536,9 +536,13 @@ class CameraWorker {
       // Successful subscription -- reset the failure counter.
       consecutive_failures = 0;
       LOG(INFO) << '[' << cfg_.ip << "] subscription -> " << sub.url;
+      subscribed_at_ms_.store(util::now_ms());
+      last_renew_ms_.store(util::now_ms());
 
       auto renew_at =
         std::chrono::steady_clock::now() + std::chrono::seconds(90);
+      auto heartbeat_at =
+        std::chrono::steady_clock::now() + std::chrono::seconds(60);
 
       bool inner_ok = true;
       while (running_ && inner_ok) {
@@ -546,8 +550,23 @@ class CameraWorker {
           absl::Status rs = renew(sub.url, sub.ref_params);
           if (!rs.ok())
             LOG(WARNING) << '[' << cfg_.ip << "] renew error: " << rs.message();
+          else
+            last_renew_ms_.store(util::now_ms());
           renew_at = std::chrono::steady_clock::now()
                      + std::chrono::seconds(90);
+        }
+        if (std::chrono::steady_clock::now() >= heartbeat_at) {
+          const uint64_t now = util::now_ms();
+          const uint64_t le  = last_event_ms_.load();
+          const uint64_t lr  = last_renew_ms_.load();
+          LOG(INFO) << '[' << cfg_.ip << "] alive: events_recv="
+                    << events_received_total_.load()
+                    << " renew_age=" << (lr ? (now - lr) / 1000 : 0) << "s"
+                    << " last_event="
+                    << (le ? std::to_string((now - le) / 1000) + "s"
+                           : std::string("never"));
+          heartbeat_at = std::chrono::steady_clock::now()
+                       + std::chrono::seconds(60);
         }
         absl::Status ps = pull(sub.url, sub.ref_params, sv.alarm_url);
         if (!ps.ok()) {
@@ -577,6 +596,8 @@ class CameraWorker {
           inner_ok = false;
         }
       }
+      // Inner loop exited (subscription dropped); reflect that in health.
+      subscribed_at_ms_.store(0);
     }
     LOG(INFO) << '[' << cfg_.ip << "] stopped";
     finished_ = true;
@@ -584,8 +605,32 @@ class CameraWorker {
 
   bool finished() const { return finished_.load(); }
 
+  // Diagnostic snapshot used by /api/camera_health.
+  struct Health {
+    std::string ip;
+    uint64_t events_received_total{0};
+    uint64_t last_event_ms{0};       // 0 = never
+    uint64_t last_renew_ms{0};       // 0 = never
+    uint64_t subscribed_at_ms{0};    // 0 = not subscribed
+    bool     subscribed{false};
+  };
+  Health health() const {
+    Health h;
+    h.ip                    = cfg_.ip;
+    h.events_received_total = events_received_total_.load();
+    h.last_event_ms         = last_event_ms_.load();
+    h.last_renew_ms         = last_renew_ms_.load();
+    h.subscribed_at_ms      = subscribed_at_ms_.load();
+    h.subscribed            = subscribed_at_ms_.load() != 0;
+    return h;
+  }
+
  private:
-  std::atomic<bool> finished_{false};
+  std::atomic<bool>     finished_{false};
+  std::atomic<uint64_t> events_received_total_{0};
+  std::atomic<uint64_t> last_event_ms_{0};
+  std::atomic<uint64_t> last_renew_ms_{0};
+  std::atomic<uint64_t> subscribed_at_ms_{0};
 
   void sleep_interruptible(int secs) {
     for (int i = 0; i < secs && running_; ++i)
@@ -801,8 +846,11 @@ class CameraWorker {
         ": " + resp.body.substr(0, 300));
 
     auto events = parse_notifications(resp.body);
-    if (!events.empty())
+    if (!events.empty()) {
       LOG(INFO) << '[' << cfg_.ip << "] received " << events.size() << " event(s)";
+      events_received_total_.fetch_add(events.size());
+      last_event_ms_.store(util::now_ms());
+    }
 
     for (auto& n : events) {
       LOG(INFO) << '[' << cfg_.ip << "]   topic=" << n.topic

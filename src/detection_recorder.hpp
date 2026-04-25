@@ -456,6 +456,21 @@ class DetectionRecorder {
 
   uint64_t coalesce_window_ms_{30000};  // --coalesce_window_sec * 1000
   uint32_t max_events_per_hour_{10};    // 0 = unlimited
+
+  // Hourly aggregate counters (L2 in v1.4.8).  Incremented from on_event()
+  // and the snapshot+MSR write paths; flushed to the journal once every
+  // 3600s.  Reset to zero after each emit.
+  std::atomic<uint64_t> stats_events_{0};
+  std::atomic<uint64_t> stats_coalesced_{0};
+  std::atomic<uint64_t> stats_rate_limited_{0};
+  std::atomic<uint64_t> stats_snapshots_{0};
+  std::atomic<uint64_t> stats_msr_ok_{0};
+  std::atomic<uint64_t> stats_msr_fail_{0};
+  std::atomic<uint64_t> stats_window_start_ms_{0};
+
+  // Emit the hourly aggregate line if a window has elapsed.  Safe to call
+  // from on_event() from any camera thread.
+  void maybe_emit_hourly_stats();
 };
 
 }  // namespace onvif

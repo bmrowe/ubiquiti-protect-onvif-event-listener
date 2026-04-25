@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -46,6 +47,13 @@ class MsrClient {
 
  private:
   std::string url_;
+
+  // Connection-state diagnostics: one log line on first successful store
+  // ("connected to <url>"), one on transition into the "suspended" state
+  // after kSuspendThreshold consecutive failures.  Reset on next success.
+  std::atomic<bool> seen_first_success_{false};
+  std::atomic<int>  consecutive_failures_{0};
+  std::atomic<bool> suspended_{false};
 };
 
 namespace msr_client_internal {
