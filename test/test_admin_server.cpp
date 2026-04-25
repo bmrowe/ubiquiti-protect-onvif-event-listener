@@ -158,6 +158,45 @@ int main() {
           "unknown GET path returns 404");
   }
 
+  // GET /api/config returns the schema + entries array.
+  {
+    const std::string req =
+        "GET /api/config HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Connection: close\r\n\r\n";
+    const std::string resp = http_exchange(port, req);
+    check(resp.find("HTTP/1.1 200") != std::string::npos,
+          "GET /api/config returns 200");
+    check(resp.find("\"entries\":[") != std::string::npos,
+          "config response contains entries[]");
+    // verbose, detect_override, msr_url all present in the schema (added
+    // across v1.4.7 and v1.4.8).
+    check(resp.find("\"name\":\"verbose\"") != std::string::npos,
+          "schema contains verbose");
+    check(resp.find("\"name\":\"detect_override\"") != std::string::npos,
+          "schema contains detect_override");
+    check(resp.find("\"name\":\"msr_url\"") != std::string::npos,
+          "schema contains msr_url");
+    check(resp.find("\"name\":\"backfill_apply\"") != std::string::npos,
+          "schema contains backfill_apply");
+  }
+
+  // GET /api/camera_health: with no DB context the handler returns an
+  // empty cameras array but still 200 (degraded, not error).
+  {
+    const std::string req =
+        "GET /api/camera_health HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Connection: close\r\n\r\n";
+    const std::string resp = http_exchange(port, req);
+    check(resp.find("HTTP/1.1 200") != std::string::npos,
+          "GET /api/camera_health returns 200 even without DB");
+    check(resp.find("\"cameras\":[]") != std::string::npos,
+          "camera_health returns empty array when DB absent");
+    check(resp.find("\"now_ms\":") != std::string::npos,
+          "camera_health includes now_ms timestamp");
+  }
+
   server.stop();
   ::unlink(channel_path.c_str());
 
