@@ -474,7 +474,8 @@ int main(int argc, char* argv[]) {
   if (admin_server.start(ONVIF_RECORDER_VERSION, channel_file, admin_port,
                          kConfigPath, cam_db,
                          absl::GetFlag(FLAGS_protect_url),
-                         protect_user_id)) {
+                         protect_user_id,
+                         raw_log, event_log)) {
     LOG(INFO) << "[admin_server] listening on 127.0.0.1:" << admin_port;
     auto ng_a = protect_ui::patch_nginx_admin_proxy(admin_port);
     if (!ng_a.ok())

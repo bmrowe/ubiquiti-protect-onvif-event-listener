@@ -501,17 +501,22 @@ setInterval(loadRecentEvents, 30000);
 namespace {
 
 // Helper: run a shell command, capture stdout+stderr, return exit code.
-// Bounded output (max 16 KiB) to avoid runaway memory if a command misbehaves.
-int run_cmd(const std::string& cmd, std::string* output) {
+// Output is bounded by @p max_bytes to avoid runaway memory if a command
+// misbehaves.  The default is 16 KiB which suits status-style probes
+// (`systemctl is-enabled`, `dpkg-query -W`, …); the diagnostic dump
+// passes a much larger cap because the journal is the whole point of
+// the dump.
+int run_cmd(const std::string& cmd, std::string* output,
+            size_t max_bytes = 16384) {
   std::string full = cmd + " 2>&1";
   FILE* pipe = popen(full.c_str(), "r");
   if (!pipe) {
     if (output) *output = "popen failed";
     return -1;
   }
-  char buf[1024];
+  char buf[4096];
   size_t total = 0;
-  while (total < 16384 && std::fgets(buf, sizeof(buf), pipe)) {
+  while (total < max_bytes && std::fgets(buf, sizeof(buf), pipe)) {
     size_t n = std::strlen(buf);
     if (output) output->append(buf, n);
     total += n;
@@ -640,6 +645,8 @@ struct Ctx {
   const unifi::DbConfig* db;  // optional; may have empty conn_string
   const char* protect_url;        // empty if Protect API not available
   const char* protect_user_id;    // empty if no X-UserId discovered
+  const char* raw_log_path;       // value of --raw_log; empty if disabled
+  const char* event_log_path;     // value of --event_log; empty if disabled
 };
 
 // Build a JSON response body for GET /api/status.
@@ -1011,11 +1018,16 @@ std::pair<int, std::string> handle_config(const Ctx& ctx,
 
 // Build a tar.gz diagnostic archive in @p out_path.  Contents:
 //   - config.json        copy of /etc/onvif-recorder/config.json
-//   - journal.log        last 1000 lines of journalctl -u onvif-recorder
-//   - camera_health.json output of /api/camera_health
 //   - status.json        output of /api/status
+//   - camera_health.json output of /api/camera_health
+//   - journal.log        journalctl -u onvif-recorder --since "12 hours ago"
+//   - journal-prev.log   journalctl -u onvif-recorder -b -1 (previous boot)
+//   - service-status.txt systemctl status onvif-recorder
+//   - raw-onvif.jsonl    tail of --raw_log file (last 5000 lines) if set
+//   - event-log.jsonl    tail of --event_log file (last 5000 lines) if set
+//   - nginx-error.log    tail of /var/log/nginx/error.log
 //   - dpkg.txt           dpkg-query -W onvif-recorder, unifi-protect, etc.
-//   - system.txt         uname -a, /sys/firmware/devicetree/base/model
+//   - system.txt         uname -a, /sys/firmware/devicetree/base/model, free, df
 // Returns ok status when the tarball exists at out_path.
 absl::Status build_diagnostic_dump(const Ctx& ctx,
                                    const std::string& out_path) {
@@ -1034,9 +1046,12 @@ absl::Status build_diagnostic_dump(const Ctx& ctx,
     if (f.is_open()) f << san.sanitize(content);
   };
   // Helper: capture the stdout of a shell command into a sanitised file.
+  // 8 MiB cap per file keeps a verbose 12-hour journal intact (journald
+  // averages ~150 B/line on this service so 8 MiB ≈ 50 k lines) while
+  // still bounding worst-case memory.
   auto capture = [&dir, &san](const char* name, const std::string& cmd) {
     std::string out;
-    run_cmd(cmd, &out);
+    run_cmd(cmd, &out, 8 * 1024 * 1024);
     std::ofstream f(dir + "/" + name, std::ios::binary | std::ios::trunc);
     if (f.is_open()) f << san.sanitize(out);
   };
@@ -1045,8 +1060,38 @@ absl::Status build_diagnostic_dump(const Ctx& ctx,
         read_file(ctx.config_path ? ctx.config_path : ""));
   write("status.json", build_status_json(ctx));
   write("camera_health.json", build_camera_health_json(ctx));
+  // 12h window covers the typical "I noticed it broke this morning" report
+  // without blowing past journald's default retention on UDM.
   capture("journal.log",
-          "journalctl -u onvif-recorder -n 1000 --no-pager 2>/dev/null");
+          "journalctl -u onvif-recorder --since '12 hours ago' "
+          "--no-pager 2>/dev/null");
+  // Previous-boot journal — invaluable when the service crashed and is
+  // the very thing the user is reporting.  Falls back gracefully if
+  // there is no prior boot recorded.
+  capture("journal-prev.log",
+          "journalctl -u onvif-recorder -b -1 --no-pager 2>/dev/null "
+          "|| echo '(no previous boot recorded)'");
+  capture("service-status.txt",
+          "systemctl status onvif-recorder --no-pager -l 2>/dev/null");
+  capture("nginx-error.log",
+          "tail -n 500 /var/log/nginx/error.log 2>/dev/null "
+          "|| echo '(nginx error log not readable)'");
+  // Raw ONVIF SOAP exchange log (--raw_log).  Only present if the flag
+  // was set; skipped silently otherwise.  Tail last 5000 lines so the
+  // archive stays small even when the file is hundreds of MB.
+  if (ctx.raw_log_path && ctx.raw_log_path[0] != '\0') {
+    capture("raw-onvif.jsonl",
+            std::string("tail -n 5000 ") + ctx.raw_log_path
+            + " 2>/dev/null || echo '(file not readable: "
+            + ctx.raw_log_path + ")'");
+  }
+  // Parsed-event log (--event_log).  Same treatment as raw_log.
+  if (ctx.event_log_path && ctx.event_log_path[0] != '\0') {
+    capture("event-log.jsonl",
+            std::string("tail -n 5000 ") + ctx.event_log_path
+            + " 2>/dev/null || echo '(file not readable: "
+            + ctx.event_log_path + ")'");
+  }
   capture("dpkg.txt",
           "dpkg-query -W -f='${Package} ${Version}\\n' "
           "onvif-recorder unifi-protect unifi-core uos 2>/dev/null");
@@ -1276,13 +1321,17 @@ bool AdminServer::start(const std::string& version,
                         const std::string& config_path,
                         const unifi::DbConfig& db,
                         const std::string& protect_url,
-                        const std::string& protect_user_id) {
+                        const std::string& protect_user_id,
+                        const std::string& raw_log_path,
+                        const std::string& event_log_path) {
   version_ = version;
   channel_file_ = channel_file;
   config_path_ = config_path;
   db_ = db;
   protect_url_ = protect_url;
   protect_user_id_ = protect_user_id;
+  raw_log_path_ = raw_log_path;
+  event_log_path_ = event_log_path;
 
   struct sockaddr_in addr{};
   addr.sin_family = AF_INET;
@@ -1292,7 +1341,8 @@ bool AdminServer::start(const std::string& version,
   // Leaked Ctx: one per server instance; lives for the program lifetime.
   auto* ctx = new Ctx{version_.c_str(), channel_file_.c_str(),
                       config_path_.c_str(), &db_,
-                      protect_url_.c_str(), protect_user_id_.c_str()};
+                      protect_url_.c_str(), protect_user_id_.c_str(),
+                      raw_log_path_.c_str(), event_log_path_.c_str()};
 
   daemon_ = MHD_start_daemon(
       MHD_USE_INTERNAL_POLLING_THREAD,
