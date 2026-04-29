@@ -76,6 +76,32 @@ class HikvisionCompatibleEmulator : public OnvifCameraEmulator {
 };
 
 // ============================================================
+// HikvisionPullPointNotAuthorizedEmulator -- Hikvision DS-2CD2387G2P-LSU/SL
+// (and other Hikvision firmware) where GetServices succeeds with the web-UI
+// admin user, but CreatePullPointSubscription returns HTTP 400 with a SOAP
+// fault `env:Sender` / `ter:NotAuthorized` because event subscription is
+// gated on a separate dedicated ONVIF user that the operator hasn't
+// configured (or has set to Operator/User instead of Administrator).
+// Reproduces the configuration class reported in issue #20.
+// ============================================================
+class HikvisionPullPointNotAuthorizedEmulator : public OnvifCameraEmulator {
+ public:
+  explicit HikvisionPullPointNotAuthorizedEmulator(
+      const std::string& jsonl_path);
+
+ protected:
+  std::pair<int, std::string> handle(
+    const std::string& path,
+    const std::string& soap_action,
+    const std::string& body) override;
+
+ private:
+  RecordedSession session_;
+  std::size_t     create_idx_{0};
+  std::mutex      mu_;
+};
+
+// ============================================================
 // CellMotionCameraEmulator -- Amcrest / Lorex / Dahua basic-motion camera
 // (subscribes immediately, emits CellMotionDetector/Motion + MotionAlarm topics)
 // ============================================================

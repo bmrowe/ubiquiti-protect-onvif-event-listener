@@ -304,6 +304,31 @@ static void test_cell_motion_events(const std::string& jsonl) {
 }
 
 // ============================================================
+// Test: Hikvision PullPoint NotAuthorized -- GetServices succeeds but
+// CreatePullPointSubscription returns HTTP 400 + ter:NotAuthorized.
+// Reproduces the real camera reported in issue #20.
+// Listener should give up gracefully after max_consecutive_failures.
+// ============================================================
+static void test_hikvision_pullpoint_notauthorized(const std::string& jsonl) {
+  HikvisionPullPointNotAuthorizedEmulator emu(jsonl);
+  emu.start();
+
+  onvif::CameraConfig cfg;
+  cfg.ip                       = emu.local_address();
+  cfg.user                     = "admin";
+  cfg.password                 = "password";
+  cfg.retry_interval_sec       = 0;
+  cfg.max_consecutive_failures = 3;
+
+  auto r = collect({cfg}, 1, std::chrono::seconds(10));
+
+  CHECK(r.timed_out,
+        "expected timeout (no events) when CreatePullPoint is NotAuthorized");
+  CHECK(r.events.empty(),
+        "expected zero events from NotAuthorized Hikvision");
+}
+
+// ============================================================
 // Test: ThinginoCameraEmulator -- listener gives up after max failures
 // ============================================================
 static void test_thingino_graceful_stop(const std::string& jsonl) {
@@ -578,7 +603,7 @@ static void test_hot_add(const std::string& jsonl) {
 // main
 // ============================================================
 int main(int argc, char* argv[]) {
-  if (argc < 16) {
+  if (argc < 17) {
     std::cerr << "Usage: " << argv[0] << "\n"
               << "  <hikvision_compatible.jsonl>\n"
               << "  <dahua_dh_sd4a425db_hny.jsonl>\n"
@@ -594,7 +619,8 @@ int main(int argc, char* argv[]) {
               << "  <unvr_251.jsonl>\n"
               << "  <unvr_1_45.jsonl>\n"
               << "  <unvr_1_47.jsonl>\n"
-              << "  <reolink_bullet.jsonl>\n";
+              << "  <reolink_bullet.jsonl>\n"
+              << "  <hikvision_pullpoint_notauthorized.jsonl>\n";
     return 1;
   }
   const std::string hikvision_jsonl      = argv[1];
@@ -612,6 +638,7 @@ int main(int argc, char* argv[]) {
   const std::string unvr_1_45_jsonl      = argv[13];
   const std::string unvr_1_47_jsonl      = argv[14];
   const std::string reolink_jsonl        = argv[15];
+  const std::string hik_notauth_jsonl    = argv[16];
 
   onvif::global_init();
 
@@ -645,6 +672,8 @@ int main(int argc, char* argv[]) {
   run_test("unvr_1_47", [&] { test_unvr_cell_motion(unvr_1_47_jsonl); });
   run_test("reolink_namespace",
            [&] { test_reolink_namespace(reolink_jsonl); });
+  run_test("hikvision_pullpoint_notauthorized",
+           [&] { test_hikvision_pullpoint_notauthorized(hik_notauth_jsonl); });
   run_test("both_cameras",
            [&] { test_both_cameras(hikvision_jsonl, dahua_jsonl); });
   run_test("axis_ref_params",

@@ -724,17 +724,32 @@ class CameraWorker {
                            << "] CreatePullPointSubscription HTTP "
                            << resp.status_code << ": "
                            << resp.body.substr(0, 300);
-      // Event-subscription auth often needs a dedicated ONVIF user
-      // (e.g. Hikvision: Configuration -> Network -> Advanced Settings ->
-      // Integration Protocol -> ONVIF), even when GetServices succeeds
-      // with the admin credentials.  Surface a clearer hint.
+      // Event-subscription auth is gated on a dedicated ONVIF user with
+      // Administrator privileges on most Hikvision firmware (and several
+      // OEM rebadges).  GetServices works with the camera's web-UI admin,
+      // but CreatePullPointSubscription rejects the same credentials with
+      // ter:NotAuthorized.  Both Operator-level and User-level ONVIF
+      // accounts produce the identical fault -- only Administrator works.
+      // Confirmed against a Hikvision DS-2CD2387G2P-LSU/SL in issue #20.
       if (resp.body.find("NotAuthorized") != std::string::npos) {
         LOG_FIRST_N(ERROR, 1)
-            << '[' << cfg_.ip << "] PullPoint subscription rejected as "
-            << "NotAuthorized -- some cameras (notably Hikvision) require "
-            << "a dedicated ONVIF user to be created in the camera's web UI "
-            << "with Administrator role, then that user's credentials "
-            << "configured in Protect.";
+            << '[' << cfg_.ip << "] PullPoint subscription rejected with "
+            << "ter:NotAuthorized.\n"
+            << "  The credentials are valid for the camera's web UI but "
+            << "not for ONVIF event subscription.\n"
+            << "  This is a separate user on most Hikvision firmware "
+            << "(and OEM rebadges).  To fix:\n"
+            << "    1. Open the camera's web UI ->\n"
+            << "       Configuration -> Network -> Advanced Settings ->\n"
+            << "       Integration Protocol -> ONVIF\n"
+            << "    2. Tick \"Enable ONVIF\" and add a user with the\n"
+            << "       \"Administrator\" level (Operator and User both\n"
+            << "       produce this exact same fault).\n"
+            << "    3. In UniFi Protect, edit the camera and replace the\n"
+            << "       credentials with that ONVIF user's username and\n"
+            << "       password (not the web-UI admin's).\n"
+            << "  Reference: "
+            << "https://github.com/danielwoz/ubiquiti-protect-onvif-event-listener/issues/20";
       }
       return Subscription{};
     }

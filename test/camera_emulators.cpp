@@ -271,6 +271,40 @@ std::pair<int, std::string> HikvisionCompatibleEmulator::handle(
 }
 
 // ============================================================
+// HikvisionPullPointNotAuthorizedEmulator
+// ============================================================
+HikvisionPullPointNotAuthorizedEmulator::
+HikvisionPullPointNotAuthorizedEmulator(const std::string& jsonl_path)
+  : OnvifCameraEmulator(peek_camera_ip(jsonl_path)) {
+  session_ = RecordedSession::from_jsonl(jsonl_path);
+}
+
+std::pair<int, std::string>
+HikvisionPullPointNotAuthorizedEmulator::handle(
+  const std::string& /*path*/,
+  const std::string& soap_action,
+  const std::string& /*body*/) {
+  std::lock_guard<std::mutex> lk(mu_);
+  const auto tail = action_tail(soap_action);
+
+  // GetServices: succeeds, advertising the events service (matching the
+  // real camera's behaviour with the web-UI admin credentials).
+  // CreatePullPointSubscription: replays the recorded 400 / NotAuthorized
+  // fault.  The listener is expected to give up gracefully after
+  // max_consecutive_failures attempts.
+  std::pair<int, std::string> resp;
+  if      (tail == "GetServicesRequest")
+    resp = {200, make_get_services_response(real_ip_, alarm_service_url_)};
+  else if (tail == "CreatePullPointSubscriptionRequest")
+    resp = next_clamp(session_.create_sub, create_idx_);
+  else
+    resp = {400, ""};
+
+  resp.second = rewrite_urls(resp.second);
+  return resp;
+}
+
+// ============================================================
 // CellMotionCameraEmulator
 // ============================================================
 CellMotionCameraEmulator::CellMotionCameraEmulator(const std::string& jsonl_path)
