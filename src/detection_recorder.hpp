@@ -299,6 +299,19 @@ class DetectionRecorder {
                                          const std::string& /*obj_type*/,
                                          const std::string& /*now_str*/) {}
 
+    /// Insert one row into smartDetectTracks with a payload JSON
+    /// describing the detection.  Native first-party events always
+    /// have a row here; without it the iOS app's Find Anything filter
+    /// skips the event.
+    virtual void insert_smart_detect_track(const std::string& /*id*/,
+                                            const std::string& /*event_id*/,
+                                            const std::string& /*camera_ip*/,
+                                            uint64_t           /*start_ms*/,
+                                            uint64_t           /*end_ms*/,
+                                            const std::string& /*obj_type*/,
+                                            int                /*confidence*/,
+                                            const std::string& /*now_str*/) {}
+
     /// Upsert label names into the `labels` table and return their serial lid
     /// values. Existing names are returned from cache to avoid redundant queries.
     /// Returns an empty vector on failure or if not implemented.

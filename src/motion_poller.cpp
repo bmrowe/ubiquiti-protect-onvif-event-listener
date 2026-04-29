@@ -93,6 +93,75 @@ std::string build_sdr_payload(uint64_t ts_ms, const std::string& obj_type,
       + "}";
 }
 
+std::string build_sdo_attributes(const std::string& obj_type, int confidence) {
+  // Mirrors the attributes column shape that native first-party
+  // smartDetectZone events write.  Nulls are sentinels Protect's UI /
+  // iOS app expect to be present (not absent).  trackerId=1 because we
+  // only emit one detection per event; zone=[] because we do not
+  // currently propagate zone IDs.
+  return std::string("{")
+      + "\"associatedFaceTrackerID\":null,"
+      + "\"blurness\":null,"
+      + "\"color\":null,"
+      + "\"confidence\":" + std::to_string(confidence) + ","
+      + "\"faceEmbed\":null,"
+      + "\"faceLandmarks\":null,"
+      + "\"faceMask\":null,"
+      + "\"facePose\":null,"
+      + "\"faceVerifyStatus\":null,"
+      + "\"line\":null,"
+      + "\"matchedId\":null,"
+      + "\"matchedName\":null,"
+      + "\"namesTopK\":null,"
+      + "\"objectType\":\"" + obj_type + "\","
+      + "\"personEmbedFromCamera\":null,"
+      + "\"qualityScore\":null,"
+      + "\"topKCandidate\":null,"
+      + "\"trackerId\":1,"
+      + "\"vehicleType\":null,"
+      + "\"zone\":[]"
+      + "}";
+}
+
+std::string build_sdt_payload(uint64_t start_ms,
+                               uint64_t end_ms,
+                               const std::string& obj_type,
+                               int confidence) {
+  // Native Protect writes one row in smartDetectTracks per event,
+  // payload = JSON array of track samples.  We only have one detection
+  // per event so the array carries a single entry.  duration is in
+  // seconds in native rows; coord is unknown (we don't propagate
+  // pixel-space bbox here) so use the same [-1, -1, -1, -1] sentinel
+  // smartDetectRaws uses.
+  const uint64_t duration_sec =
+      (end_ms > start_ms) ? (end_ms - start_ms) / 1000 : 0;
+  const std::string start_str = std::to_string(start_ms);
+  const std::string end_str   = std::to_string(end_ms);
+  const std::string conf_str  = std::to_string(confidence);
+  const std::string dur_str   = std::to_string(duration_sec);
+  return std::string("[{")
+      + "\"attributes\":null,"
+      + "\"confidence\":" + conf_str + ","
+      + "\"coord\":[-1.0,-1.0,-1.0,-1.0],"
+      + "\"coord3d\":[-1.0,-1.0],"
+      + "\"depth\":null,"
+      + "\"duration\":" + dur_str + ","
+      + "\"firstShownTimeMs\":" + start_str + ","
+      + "\"id\":\"1\","
+      + "\"idleSinceTimeMs\":0,"
+      + "\"licensePlate\":null,"
+      + "\"lines\":[],"
+      + "\"loiterZones\":[],"
+      + "\"matchedId\":null,"
+      + "\"name\":\"\","
+      + "\"objectType\":\"" + obj_type + "\","
+      + "\"speed\":null,"
+      + "\"stationary\":false,"
+      + "\"timestamp\":" + end_str + ","
+      + "\"zones\":[]"
+      + "}]";
+}
+
 }  // namespace motion_poller_internal
 
 namespace {
@@ -575,7 +644,8 @@ void MotionPoller::poll_loop() {
         // INSERT smartDetectObjects.
         {
           const std::string attr_json =
-              "{\"confidence\":" + conf_str + "}";
+              motion_poller_internal::build_sdo_attributes(
+                  obj_type, confidence);
           const char* sp[] = {
             sdo_id.c_str(), new_event_id.c_str(), new_thumb_id.c_str(),
             cam_id.c_str(), obj_type.c_str(), attr_json.c_str(),
@@ -591,6 +661,29 @@ void MotionPoller::poll_loop() {
             9, nullptr, sp, nullptr, nullptr, 0);
           if (PQresultStatus(r) != PGRES_COMMAND_OK)
             LOG(ERROR) << "[motion_poller] insert sdo: "
+                       << PQerrorMessage(impl_->conn);
+          PQclear(r);
+        }
+
+        // INSERT smartDetectTracks.  Required for the iOS app's Find
+        // Anything filter to surface our events alongside native ones.
+        {
+          const std::string sdtrk_id      = util::generate_uuid();
+          const std::string sdtrk_payload =
+              motion_poller_internal::build_sdt_payload(
+                  start_ms, end_ms, obj_type, confidence);
+          const char* tp[] = {
+            sdtrk_id.c_str(), new_event_id.c_str(), cam_id.c_str(),
+            sdtrk_payload.c_str(), now_str.c_str(), now_str.c_str()
+          };
+          PGresult* r = PQexecParams(impl_->conn,
+            "INSERT INTO \"smartDetectTracks\""
+            " (id, \"eventId\", \"cameraId\", payload,"
+            "  \"createdAt\", \"updatedAt\")"
+            " VALUES ($1, $2, $3, $4::json, $5, $6)",
+            6, nullptr, tp, nullptr, nullptr, 0);
+          if (PQresultStatus(r) != PGRES_COMMAND_OK)
+            LOG(ERROR) << "[motion_poller] insert sdt: "
                        << PQerrorMessage(impl_->conn);
           PQclear(r);
         }

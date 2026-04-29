@@ -517,6 +517,61 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
       6, params);
   }
 
+  // Insert one row into smartDetectTracks.  Required for the iOS
+  // app's Find Anything filter to surface our events alongside native
+  // first-party smart-detect events.  Payload mirrors the array of
+  // track samples Protect itself writes; we only have one sample per
+  // event so the array carries a single entry with [-1,-1,-1,-1] as
+  // the unknown-bbox sentinel.
+  void insert_smart_detect_track(const std::string& id,
+                                  const std::string& event_id,
+                                  const std::string& camera_ip,
+                                  uint64_t           start_ms,
+                                  uint64_t           end_ms,
+                                  const std::string& obj_type,
+                                  int                confidence,
+                                  const std::string& now_str) override {
+    const std::string& cam_id  = camera_id(camera_ip);
+    const uint64_t duration_sec =
+        (end_ms > start_ms) ? (end_ms - start_ms) / 1000 : 0;
+    const std::string start_str = std::to_string(start_ms);
+    const std::string end_str   = std::to_string(end_ms);
+    const std::string conf_str  = std::to_string(confidence);
+    const std::string dur_str   = std::to_string(duration_sec);
+    const std::string payload =
+        std::string("[{")
+        + "\"attributes\":null,"
+        + "\"confidence\":" + conf_str + ","
+        + "\"coord\":[-1.0,-1.0,-1.0,-1.0],"
+        + "\"coord3d\":[-1.0,-1.0],"
+        + "\"depth\":null,"
+        + "\"duration\":" + dur_str + ","
+        + "\"firstShownTimeMs\":" + start_str + ","
+        + "\"id\":\"1\","
+        + "\"idleSinceTimeMs\":0,"
+        + "\"licensePlate\":null,"
+        + "\"lines\":[],"
+        + "\"loiterZones\":[],"
+        + "\"matchedId\":null,"
+        + "\"name\":\"\","
+        + "\"objectType\":\"" + obj_type + "\","
+        + "\"speed\":null,"
+        + "\"stationary\":false,"
+        + "\"timestamp\":" + end_str + ","
+        + "\"zones\":[]"
+        + "}]";
+    const char* params[] = {
+      id.c_str(), event_id.c_str(), cam_id.c_str(),
+      payload.c_str(), now_str.c_str(), now_str.c_str()
+    };
+    exec_params(
+      "INSERT INTO \"smartDetectTracks\""
+      " (id, \"eventId\", \"cameraId\", payload,"
+      "  \"createdAt\", \"updatedAt\")"
+      " VALUES ($1, $2, $3, $4::json, $5, $6)",
+      6, params);
+  }
+
   // Upsert one label name; return its serial lid, or 0 on failure.
   int upsert_label(const std::string& name, const std::string& now_str) {
     auto it = label_cache_.find(name);
@@ -1145,11 +1200,39 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
                                                               : coalesced_event_id;
     const std::string sdo_id     = util::generate_uuid();
     const std::string sdr_id     = util::generate_uuid();
+    const std::string sdtrk_id   = util::generate_uuid();
     // thumb_id is finalised below, after a potential MSR StoreSnapshots call.
     std::string thumb_id;
     std::string sdt_json   = smart_detect_types_json(det->type);
     std::string obj_type   = sdo_type(det->type);
-    const std::string attributes = "{\"confidence\":0,\"zone\":[1]}";
+    // Mirrors the attributes shape native first-party smartDetectZone
+    // events write; consumers (Find Anything filter, iOS app) skip our
+    // events when the shape is sparse.  confidence remains 0 here
+    // because detection_recorder does not yet propagate a real
+    // detection score from the ONVIF event path -- separate fix.
+    const std::string attributes =
+        std::string("{")
+        + "\"associatedFaceTrackerID\":null,"
+        + "\"blurness\":null,"
+        + "\"color\":null,"
+        + "\"confidence\":0,"
+        + "\"faceEmbed\":null,"
+        + "\"faceLandmarks\":null,"
+        + "\"faceMask\":null,"
+        + "\"facePose\":null,"
+        + "\"faceVerifyStatus\":null,"
+        + "\"line\":null,"
+        + "\"matchedId\":null,"
+        + "\"matchedName\":null,"
+        + "\"namesTopK\":null,"
+        + "\"objectType\":\"" + obj_type + "\","
+        + "\"personEmbedFromCamera\":null,"
+        + "\"qualityScore\":null,"
+        + "\"topKCandidate\":null,"
+        + "\"trackerId\":1,"
+        + "\"vehicleType\":null,"
+        + "\"zone\":[]"
+        + "}";
 
     // 3. Fetch snapshot if the backend needs it.
     std::vector<unsigned char> snapshot;
@@ -1260,11 +1343,15 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
           recent_event_times_[ev.camera_ip].push_back(util::now_ms());
       }
 
-      // Always insert SDO + smartDetectRaw for every detection occurrence,
-      // even when coalescing -- this records each hit within the merged event.
+      // Always insert SDO + smartDetectRaw + smartDetectTrack for every
+      // detection occurrence, even when coalescing -- this records each
+      // hit within the merged event.
       db_->insert_sdo(sdo_id, event_id, thumb_id, ev.camera_ip,
                       obj_type, attributes, ts_ms, now_str);
       db_->insert_smart_detect_raw(sdr_id, ev.camera_ip, ts_ms, obj_type, now_str);
+      db_->insert_smart_detect_track(sdtrk_id, event_id, ev.camera_ip,
+                                      ts_ms, ts_ms, obj_type,
+                                      /*confidence=*/0, now_str);
 
       // Insert detectionLabels rows so events appear in Protect's find-anything
       // endpoint (which does INNER JOIN on detectionLabels WHERE objectId IS NULL).

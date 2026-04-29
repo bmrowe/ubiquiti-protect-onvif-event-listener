@@ -41,6 +41,24 @@ std::string smart_detect_types_json(const std::string& det_type);
 std::string build_sdr_payload(uint64_t ts_ms, const std::string& obj_type,
                               int confidence);
 
+/// Build the smartDetectObjects.attributes JSON to mirror what native
+/// Protect smart-detect events write (mostly nulls + objectType +
+/// confidence + zone).  Without this richer shape, downstream consumers
+/// such as the iOS app's Find Anything filter skip the event.  Exposed
+/// for testing.
+std::string build_sdo_attributes(const std::string& obj_type,
+                                  int confidence);
+
+/// Build the smartDetectTracks.payload JSON for a single detection
+/// covering [@p start_ms, @p end_ms] with object class @p obj_type.
+/// Native Protect events write one row in this table per detection;
+/// without it, the Find Anything filter does not surface our events.
+/// Exposed for testing.
+std::string build_sdt_payload(uint64_t start_ms,
+                               uint64_t end_ms,
+                               const std::string& obj_type,
+                               int confidence);
+
 }  // namespace motion_poller_internal
 
 class AlarmNotifier;

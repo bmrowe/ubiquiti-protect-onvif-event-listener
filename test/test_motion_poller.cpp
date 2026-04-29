@@ -121,6 +121,97 @@ static void test_build_sdr_payload_object_type_varies() {
 }
 
 // ---------------------------------------------------------------
+// build_sdo_attributes
+// ---------------------------------------------------------------
+static void test_build_sdo_attributes_fields() {
+  using onvif::motion_poller_internal::build_sdo_attributes;
+  std::string j = build_sdo_attributes("vehicle", 87);
+
+  // Object type and confidence should appear verbatim.
+  check(contains(j, "\"objectType\":\"vehicle\""),
+        "build_sdo_attributes: objectType=vehicle");
+  check(contains(j, "\"confidence\":87"),
+        "build_sdo_attributes: confidence=87");
+
+  // Schema fields the iOS app expects to be present (as null sentinels).
+  check(contains(j, "\"associatedFaceTrackerID\":null"),
+        "build_sdo_attributes: associatedFaceTrackerID null");
+  check(contains(j, "\"faceEmbed\":null"),
+        "build_sdo_attributes: faceEmbed null");
+  check(contains(j, "\"matchedId\":null"),
+        "build_sdo_attributes: matchedId null");
+  check(contains(j, "\"trackerId\":1"),
+        "build_sdo_attributes: trackerId=1");
+  check(contains(j, "\"vehicleType\":null"),
+        "build_sdo_attributes: vehicleType null");
+  check(contains(j, "\"zone\":[]"),
+        "build_sdo_attributes: zone empty array");
+
+  check(!j.empty() && j.front() == '{' && j.back() == '}',
+        "build_sdo_attributes: outer braces present");
+}
+
+static void test_build_sdo_attributes_object_type_varies() {
+  using onvif::motion_poller_internal::build_sdo_attributes;
+  std::string p = build_sdo_attributes("person",  80);
+  std::string a = build_sdo_attributes("animal",  80);
+  std::string k = build_sdo_attributes("package", 80);
+  check(contains(p, "\"objectType\":\"person\""),
+        "build_sdo_attributes: person");
+  check(contains(a, "\"objectType\":\"animal\""),
+        "build_sdo_attributes: animal");
+  check(contains(k, "\"objectType\":\"package\""),
+        "build_sdo_attributes: package");
+}
+
+// ---------------------------------------------------------------
+// build_sdt_payload (smartDetectTracks)
+// ---------------------------------------------------------------
+static void test_build_sdt_payload_fields() {
+  using onvif::motion_poller_internal::build_sdt_payload;
+  const uint64_t start = 1712345678901ULL;
+  const uint64_t end   = 1712345681901ULL;  // +3s
+  std::string j = build_sdt_payload(start, end, "person", 92);
+
+  // Outer wrapper is a JSON array of one entry.
+  check(!j.empty() && j.front() == '[' && j.back() == ']',
+        "build_sdt_payload: outer array brackets");
+
+  // Object type and confidence carry through.
+  check(contains(j, "\"objectType\":\"person\""),
+        "build_sdt_payload: objectType");
+  check(contains(j, "\"confidence\":92"),
+        "build_sdt_payload: confidence");
+
+  // Timestamps and duration (seconds).
+  check(contains(j, "\"firstShownTimeMs\":1712345678901"),
+        "build_sdt_payload: firstShownTimeMs");
+  check(contains(j, "\"timestamp\":1712345681901"),
+        "build_sdt_payload: timestamp = end_ms");
+  check(contains(j, "\"duration\":3"),
+        "build_sdt_payload: duration in seconds");
+
+  // Sentinel coord and stable defaults.
+  check(contains(j, "\"coord\":[-1.0,-1.0,-1.0,-1.0]"),
+        "build_sdt_payload: coord sentinel");
+  check(contains(j, "\"id\":\"1\""),
+        "build_sdt_payload: id");
+  check(contains(j, "\"zones\":[]"),
+        "build_sdt_payload: zones empty array");
+}
+
+static void test_build_sdt_payload_zero_duration() {
+  using onvif::motion_poller_internal::build_sdt_payload;
+  // end_ms <= start_ms → duration clamps to 0.
+  std::string j = build_sdt_payload(1000, 1000, "person", 50);
+  check(contains(j, "\"duration\":0"),
+        "build_sdt_payload: zero-duration when end <= start");
+  std::string j2 = build_sdt_payload(2000, 1500, "person", 50);
+  check(contains(j2, "\"duration\":0"),
+        "build_sdt_payload: zero-duration when end < start");
+}
+
+// ---------------------------------------------------------------
 // object_detect::detection_type coverage for the package classes
 // added alongside animal support (see object_detect.hpp).  Lives
 // here rather than its own file because motion_poller is the only
@@ -152,6 +243,10 @@ int main() {
   test_smart_detect_types_person_default();
   test_build_sdr_payload_fields();
   test_build_sdr_payload_object_type_varies();
+  test_build_sdo_attributes_fields();
+  test_build_sdo_attributes_object_type_varies();
+  test_build_sdt_payload_fields();
+  test_build_sdt_payload_zero_duration();
   test_detection_type_coco_mapping();
 
   std::cout << "test_motion_poller: "
