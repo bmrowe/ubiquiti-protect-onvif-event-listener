@@ -3,19 +3,19 @@ Label: onvif-recorder
 Suite: early-access
 Codename: early-access
 Version: 1.0
-Date: Wed, 29 Apr 2026 07:41:04 UTC
+Date: Sun, 03 May 2026 07:50:56 UTC
 Architectures: arm64
 Components: main
 Description: onvif-recorder early access channel
 MD5Sum:
- 8fd6aa14e07e9bc43ac7e6391f805aba 984 main/binary-arm64/Packages
- 4deff79d84f6f22fc7a1ce93d9e03965 620 main/binary-arm64/Packages.gz
+ 2c9326bb34929440595d335b83d21b87 984 main/binary-arm64/Packages
+ edd25ac4cdb7f203e4298ef04b7f5d26 622 main/binary-arm64/Packages.gz
  076d60eae68e53d636c29cd37330ba67 165 main/binary-arm64/Release
 SHA1:
- 2923b4a3fae0f42f1a482ce56547f879d2fef20b 984 main/binary-arm64/Packages
- 0d519f16993d95592a2b27facd022ea1da61f828 620 main/binary-arm64/Packages.gz
+ 6cd93873e4e87eef77f0eadd7b96f1159ebd8910 984 main/binary-arm64/Packages
+ 210700060e1c1a400395a5971685558d12c5168b 622 main/binary-arm64/Packages.gz
  e5218f24dec7392e7a9f1d7b2817d01202470f1e 165 main/binary-arm64/Release
 SHA256:
- 89a791503ec434baa943f6e37d53aab4fa99869cc03cc92c3dc27e3efb858863 984 main/binary-arm64/Packages
- 0ec6d6d87df372f3921cd4bd10f15f4ad246096c6080538dace654fa9591d1c5 620 main/binary-arm64/Packages.gz
+ 94a6ad5303b984aa8b95fab90cdedb5a42d6d2c4681d721ce8c78265d30961d2 984 main/binary-arm64/Packages
+ f658fe00f23ebc6b3a1e1edd83d214116b1f664868e418e44445411d8e273d7e 622 main/binary-arm64/Packages.gz
  13bd0a78c3d0a20e054cd2668b26c2180bb3e246dfde6a3ef76e3392d023f8bb 165 main/binary-arm64/Release
