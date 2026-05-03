@@ -1,0 +1,5 @@
+# Fire our trigger whenever any other package modifies the Protect
+# application tree.  In practice this means a unifi-protect upgrade --
+# at that point the recorder needs to bounce so it can re-apply the
+# swai.js / nginx patches against the new files.
+interest-noawait /usr/share/unifi-protect/app

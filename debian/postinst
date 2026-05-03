@@ -97,6 +97,16 @@ case "$1" in
             systemctl try-restart onvif-recorder.service || true
         fi
         ;;
+    triggered)
+        # Activated whenever another package modifies one of the paths
+        # listed in debian/triggers (currently /usr/share/unifi-protect/app).
+        # The recorder re-applies all swai.js / nginx patches on startup,
+        # so a try-restart is the whole intervention -- it picks up the
+        # new file hashes and re-injects the picker patch + nginx blocks.
+        # `try-restart` (rather than `restart`) leaves the service alone
+        # if the user has explicitly stopped it.
+        systemctl try-restart onvif-recorder.service || true
+        ;;
     abort-upgrade|abort-remove|abort-deconfigure)
         ;;
     *)

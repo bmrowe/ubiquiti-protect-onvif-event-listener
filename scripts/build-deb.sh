@@ -205,6 +205,7 @@ install -m 0755 debian/preinst   "$STAGE/DEBIAN/preinst"
 install -m 0755 debian/postinst  "$STAGE/DEBIAN/postinst"
 install -m 0755 debian/prerm     "$STAGE/DEBIAN/prerm"
 install -m 0755 debian/postrm    "$STAGE/DEBIAN/postrm"
+install -m 0644 debian/triggers  "$STAGE/DEBIAN/triggers"
 
 # ---------------------------------------------------------------------------
 # Build .deb
