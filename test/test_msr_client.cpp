@@ -20,10 +20,13 @@
  * only by integration testing against a live router.
  */
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "msr_client.hpp"
@@ -205,6 +208,144 @@ static void test_roundtrip_empty_api_does_not_crash() {
   check(id.empty(), "empty URL returns empty id");
 }
 
+// ---------------------------------------------------------------
+// Single-flight serialisation
+// ---------------------------------------------------------------
+//
+// Test perform-fn that holds the mutex long enough for the test to
+// observe overlap.  Increments g_concurrent on entry, decrements on
+// exit, tracks the maximum observed concurrent count globally so the
+// callback can be a plain C function pointer.
+namespace serialize_test {
+static std::atomic<int> in_flight{0};
+static std::atomic<int> peak_concurrent{0};
+static std::atomic<int> calls_seen{0};
+
+static std::string slow_perform(const std::string& /*mac*/,
+                                const std::string& /*jpeg*/) {
+  int now = in_flight.fetch_add(1) + 1;
+  // Track the peak so we can assert it stayed at 1 with serialize on.
+  int prev = peak_concurrent.load();
+  while (now > prev && !peak_concurrent.compare_exchange_weak(prev, now)) {
+    /* retry */
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(40));
+  in_flight.fetch_sub(1);
+  calls_seen.fetch_add(1);
+  return "ok-id";
+}
+}  // namespace serialize_test
+
+static void run_concurrent_calls(onvif::MsrClient* client, int n_threads) {
+  serialize_test::in_flight.store(0);
+  serialize_test::peak_concurrent.store(0);
+  serialize_test::calls_seen.store(0);
+  std::vector<std::thread> ts;
+  ts.reserve(n_threads);
+  for (int i = 0; i < n_threads; ++i) {
+    ts.emplace_back([client]() {
+      // Non-empty url + mac + jpeg so we don't hit the empty-input
+      // short-circuit.
+      client->StoreSnapshot("AABBCCDDEEFF", "JPEG", 4);
+    });
+  }
+  for (auto& t : ts) t.join();
+}
+
+static void test_serialize_caps_concurrency_to_one() {
+  onvif::MsrClient client("http://127.0.0.1:1");  // url non-empty; perform-fn replaces curl
+  client.set_perform_fn_for_testing(&serialize_test::slow_perform);
+  client.set_serialize(true);
+
+  run_concurrent_calls(&client, 8);
+
+  check(serialize_test::calls_seen.load() == 8,
+        "serialize: all 8 calls completed");
+  check(serialize_test::peak_concurrent.load() == 1,
+        "serialize: peak concurrent calls capped at 1");
+}
+
+static void test_serialize_off_allows_concurrency() {
+  onvif::MsrClient client("http://127.0.0.1:1");
+  client.set_perform_fn_for_testing(&serialize_test::slow_perform);
+  client.set_serialize(false);
+
+  run_concurrent_calls(&client, 8);
+
+  check(serialize_test::calls_seen.load() == 8,
+        "no-serialize: all 8 calls completed");
+  check(serialize_test::peak_concurrent.load() > 1,
+        "no-serialize: observed concurrent calls > 1");
+}
+
+// ---------------------------------------------------------------
+// Suspension cool-down
+// ---------------------------------------------------------------
+namespace cooldown_test {
+static std::atomic<int> calls_seen{0};
+static std::string ok_perform(const std::string& /*mac*/,
+                              const std::string& /*jpeg*/) {
+  calls_seen.fetch_add(1);
+  return "ok-id";
+}
+static std::int64_t fake_now_ms = 0;
+static std::int64_t clock() { return fake_now_ms; }
+}  // namespace cooldown_test
+
+static void test_cooldown_skips_calls_when_suspended_within_window() {
+  onvif::MsrClient client("http://127.0.0.1:1");
+  client.set_perform_fn_for_testing(&cooldown_test::ok_perform);
+  client.set_clock_for_testing(&cooldown_test::clock);
+  client.set_suspend_cooldown(10);  // 10s
+
+  cooldown_test::fake_now_ms = 1'000'000;
+  client.set_last_failure_for_testing(cooldown_test::fake_now_ms);
+  client.set_suspended_for_testing(true);
+
+  cooldown_test::calls_seen.store(0);
+  // 5 seconds after last failure: still inside cool-down → must skip.
+  cooldown_test::fake_now_ms = 1'005'000;
+  std::string id = client.StoreSnapshot("AABBCCDDEEFF", "X", 1);
+  check(id.empty(), "cooldown: returns empty inside window");
+  check(cooldown_test::calls_seen.load() == 0,
+        "cooldown: perform-fn NOT invoked inside window");
+}
+
+static void test_cooldown_allows_probe_after_window_elapses() {
+  onvif::MsrClient client("http://127.0.0.1:1");
+  client.set_perform_fn_for_testing(&cooldown_test::ok_perform);
+  client.set_clock_for_testing(&cooldown_test::clock);
+  client.set_suspend_cooldown(10);
+
+  cooldown_test::fake_now_ms = 2'000'000;
+  client.set_last_failure_for_testing(cooldown_test::fake_now_ms);
+  client.set_suspended_for_testing(true);
+
+  cooldown_test::calls_seen.store(0);
+  // 11 seconds after last failure: cool-down elapsed → probe allowed.
+  cooldown_test::fake_now_ms = 2'011'000;
+  std::string id = client.StoreSnapshot("AABBCCDDEEFF", "X", 1);
+  check(id == "ok-id", "cooldown: probe call returns id after window");
+  check(cooldown_test::calls_seen.load() == 1,
+        "cooldown: perform-fn invoked exactly once after window");
+}
+
+static void test_cooldown_disabled_always_attempts() {
+  onvif::MsrClient client("http://127.0.0.1:1");
+  client.set_perform_fn_for_testing(&cooldown_test::ok_perform);
+  client.set_clock_for_testing(&cooldown_test::clock);
+  // cooldown=0 (default) — suspension is not honoured at the call site.
+  client.set_suspended_for_testing(true);
+  client.set_last_failure_for_testing(0);
+
+  cooldown_test::calls_seen.store(0);
+  cooldown_test::fake_now_ms = 100;
+  std::string id = client.StoreSnapshot("AABBCCDDEEFF", "X", 1);
+  check(id == "ok-id", "cooldown=0: call still attempted while suspended");
+  check(cooldown_test::calls_seen.load() == 1,
+        "cooldown=0: perform-fn invoked");
+}
+
 int main() {
   test_build_store_request_shape();
   test_build_store_request_large_jpeg();
@@ -215,6 +356,11 @@ int main() {
   test_parse_store_response_result_missing_id();
   test_parse_store_response_truncated_length();
   test_roundtrip_empty_api_does_not_crash();
+  test_serialize_caps_concurrency_to_one();
+  test_serialize_off_allows_concurrency();
+  test_cooldown_skips_calls_when_suspended_within_window();
+  test_cooldown_allows_probe_after_window_elapses();
+  test_cooldown_disabled_always_attempts();
 
   std::cerr << "\nResult: " << g_pass << " passed, "
             << g_fail << " failed\n";

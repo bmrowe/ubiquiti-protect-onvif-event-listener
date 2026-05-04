@@ -1032,6 +1032,24 @@ void DetectionRecorder::set_msr_client(MsrClient* msr) {
   msr_client_ = msr;
 }
 
+void DetectionRecorder::set_msr_drop_on_failure(bool drop) {
+  absl::MutexLock lk(&mu_);
+  msr_drop_on_failure_ = drop;
+}
+
+void DetectionRecorder::set_msr_burst_window_ms(uint64_t ms) {
+  absl::MutexLock lk(&mu_);
+  msr_burst_window_ms_ = ms;
+}
+
+uint64_t DetectionRecorder::msr_calls_for_testing() const {
+  return stats_msr_ok_.load() + stats_msr_fail_.load();
+}
+
+uint64_t DetectionRecorder::msr_burst_reuses_for_testing() const {
+  return stats_msr_burst_reuses_.load();
+}
+
 void DetectionRecorder::set_detector(
     const object_detect::ObjectDetector* detector) {
   absl::MutexLock lk(&mu_);
@@ -1126,6 +1144,9 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     bool det_override;
     AlarmNotifier* alarm_notif;
     MsrClient* msr;
+    bool msr_drop_on_failure;
+    uint64_t msr_burst_window_ms;
+    std::string burst_cached_id;  // empty if no recent id within window
     // Non-empty when merging this detection into an existing event row.
     std::string coalesced_event_id;
     {
@@ -1190,6 +1211,22 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
       det_override = detect_override_;
       alarm_notif  = alarm_notifier_;
       msr          = msr_client_;
+      msr_drop_on_failure = msr_drop_on_failure_;
+      msr_burst_window_ms = msr_burst_window_ms_;
+      // Probe the burst cache while we still hold the lock.  We can't
+      // know the camera_mac yet (cit/mit lookups happen above this
+      // line so cam_mac is set), so do this after camera-mac resolution.
+      if (msr_burst_window_ms > 0 && !cam_mac.empty()) {
+        auto bit = msr_burst_cache_.find(cam_mac);
+        if (bit != msr_burst_cache_.end()) {
+          const uint64_t age =
+              util::now_ms() > bit->second.ts_ms
+                  ? util::now_ms() - bit->second.ts_ms : 0;
+          if (age <= msr_burst_window_ms) {
+            burst_cached_id = bit->second.id;
+          }
+        }
+      }
     }
 
     // 2. Compute timestamps and IDs (no lock -- needs ip_to_mac_ which is read-only).
@@ -1310,8 +1347,22 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     // 3b. Forward the cropped JPEG to MSR when configured.  MSR persists it as
     // a native UBV thumbnail and returns an id that the Protect UI serves via
     // MSP TCP — indistinguishable from first-party cameras.
+    //
+    // Burst-coalesce: if a recent successful MSR id is cached for this
+    // camera (within msr_burst_window_ms), reuse it and skip the call.
+    // Each detection still gets its own DB rows; they all reference the
+    // cached thumbnail, so MSR / Protect's thumbnails table see one
+    // write per burst rather than one per event.
     bool stored_by_msr = false;
-    if (msr && !snapshot.empty() && !cam_mac.empty()) {
+    if (msr && !snapshot.empty() && !cam_mac.empty()
+        && !burst_cached_id.empty()) {
+      thumb_id = burst_cached_id;
+      stored_by_msr = true;
+      stats_msr_burst_reuses_.fetch_add(1);
+      LOG(INFO) << '[' << ev.camera_ip << "] MSR burst-reuse id="
+                << burst_cached_id;
+    }
+    if (msr && !stored_by_msr && !snapshot.empty() && !cam_mac.empty()) {
       std::string msr_id = msr->StoreSnapshot(
           cam_mac, snapshot.data(), snapshot.size());
       if (!msr_id.empty()) {
@@ -1320,11 +1371,31 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
         LOG(INFO) << '[' << ev.camera_ip << "] MSR stored snapshot as id="
                   << msr_id;
         stats_msr_ok_.fetch_add(1);
+        // Cache for the next event in this burst (under main lock to
+        // keep msr_burst_cache_ access serialised).
+        if (msr_burst_window_ms > 0) {
+          absl::MutexLock lk(&mu_);
+          msr_burst_cache_[cam_mac] = {msr_id, util::now_ms()};
+        }
       } else {
-        LOG(WARNING) << '[' << ev.camera_ip
-                     << "] MSR StoreSnapshots failed; "
-                     << "falling back to local thumbnail write";
         stats_msr_fail_.fetch_add(1);
+        if (msr_drop_on_failure) {
+          // Dropping the snapshot is the right call here: writing it
+          // ourselves into the same `thumbnails` table that Protect
+          // (via MSR) is also trying to write piles contention onto a
+          // hot path and is what knocks Protect's UI offline (#24).
+          // Clear the snapshot so the UBV + thumbnails INSERT below
+          // are skipped.  thumb_id is left empty; make_thumbnail_id()
+          // below still generates a placeholder id for event/SDO rows.
+          LOG(WARNING) << '[' << ev.camera_ip
+                       << "] MSR StoreSnapshots failed; "
+                       << "dropping snapshot (msr_drop_on_failure=true)";
+          snapshot.clear();
+        } else {
+          LOG(WARNING) << '[' << ev.camera_ip
+                       << "] MSR StoreSnapshots failed; "
+                       << "falling back to local thumbnail write";
+        }
       }
     }
     if (thumb_id.empty()) {

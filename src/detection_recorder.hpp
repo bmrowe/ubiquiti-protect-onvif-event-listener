@@ -241,6 +241,31 @@ class DetectionRecorder {
   /// Must be called before run().  The client must outlive the recorder.
   void set_msr_client(MsrClient* msr);
 
+  /// When true, an MSR StoreSnapshots failure causes the detection's
+  /// thumbnail to be dropped entirely instead of falling back to a direct
+  /// `thumbnails`-table INSERT.  Default false (preserves prior behaviour:
+  /// fall back to DB write).  The fallback path is what compounds DB
+  /// contention on a busy router — Protect's own writers are blocked on
+  /// the same table — so production deployments should set this to true.
+  void set_msr_drop_on_failure(bool drop);
+
+  /// When @p ms > 0 and a successful MSR StoreSnapshots id was returned
+  /// for this camera within the last @p ms milliseconds, reuse that id
+  /// instead of calling MSR again.  This is the queue-coalescing
+  /// behaviour: bursts of detections for the same camera collapse onto
+  /// a single MSR snapshot, so MSR's worker pool isn't saturated by
+  /// near-duplicate snapshots.  Each event still gets its own DB rows
+  /// (event/SDO/raw/track/labels), but they reference the cached MSR
+  /// thumbnail.  Set to 0 to disable (default 0 — legacy behaviour:
+  /// every event makes its own MSR call).
+  void set_msr_burst_window_ms(uint64_t ms);
+
+  /// Test observability — number of times MSR was actually contacted
+  /// vs. how many events triggered an MSR-eligible path.  Reset by the
+  /// hourly aggregate emitter.
+  uint64_t msr_calls_for_testing() const;
+  uint64_t msr_burst_reuses_for_testing() const;
+
   // Defined in detection_recorder.cpp -- public so concrete backends in the
   // .cpp translation unit can inherit from it without friendship.
   struct IDbBackend {
@@ -448,6 +473,24 @@ class DetectionRecorder {
 
   // Optional MSR gRPC client. Set before run(); non-owning raw pointer.
   MsrClient* msr_client_{nullptr};
+
+  // When true, on MSR failure, drop the snapshot entirely (no thumbnails
+  // INSERT, no UBV write).  Default false (legacy fallback to DB write).
+  bool msr_drop_on_failure_{false};
+
+  // When > 0 and a recent MSR id is cached within this window for the
+  // same camera, reuse it instead of calling MSR again.  Default 0 = off.
+  uint64_t msr_burst_window_ms_{0};
+
+  // Per-camera-mac most-recent successful MSR id and its wall-clock ms.
+  struct MsrBurstCache {
+    std::string id;          // last successful StoreSnapshots id
+    uint64_t    ts_ms{0};    // wall-clock ms when stored
+  };
+  std::map<std::string, MsrBurstCache> msr_burst_cache_;
+
+  // Test observability — counts updates as on_event flows.
+  std::atomic<uint64_t> stats_msr_burst_reuses_{0};
 
   // Object type for generic motion events (CellMotionDetector, MotionAlarm).
   std::string default_object_type_{"person"};

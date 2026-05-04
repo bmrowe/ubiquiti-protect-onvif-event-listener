@@ -2315,6 +2315,204 @@ static void test_purge_stale_open_events() {
 }
 
 // ============================================================
+// MSR burst-window coalescing under slow MSR / slow DB
+//
+// Drives 3 STARTED+ENDED detections for one camera through a real
+// SnapshotSyntheticEmulator + OnvifListener.  An MSR perform-fn stub
+// sleeps 80 ms per call so a "fast" pile-up of detections cannot
+// happen without coalescing.  With msr_burst_window_ms=5000 the
+// expected outcome is exactly 1 actual StoreSnapshots call followed
+// by 2 burst-reuses — same id stamped onto every detection without
+// MSR being touched again.
+// ============================================================
+#include "msr_client.hpp"
+
+namespace burst_test {
+static std::atomic<int> calls_seen{0};
+static std::string slow_perform(const std::string& /*mac*/,
+                                const std::string& /*jpeg*/) {
+  calls_seen.fetch_add(1);
+  std::this_thread::sleep_for(std::chrono::milliseconds(80));
+  return "BURST-IDOK";
+}
+}  // namespace burst_test
+
+// SlowMockBackend wraps every mutating insert with a configurable
+// sleep so the test can also confirm the queue holds while DB writes
+// are in flight.  Default sleep = 0 (behaves identically to MockBackend).
+struct SlowMockBackend : MockBackend {
+  std::atomic<int> insert_sleep_ms{0};
+
+  void insert_event(const std::string& id, uint64_t ts_ms,
+                    const std::string& camera_ip,
+                    const std::string& sdt_json,
+                    const std::string& thumb_id,
+                    const std::string& now_str) override {
+    int s = insert_sleep_ms.load();
+    if (s > 0) std::this_thread::sleep_for(std::chrono::milliseconds(s));
+    MockBackend::insert_event(id, ts_ms, camera_ip, sdt_json,
+                              thumb_id, now_str);
+  }
+
+  void write_thumbnail(const std::string& thumb_id,
+                       const std::string& event_id,
+                       const std::string& camera_ip,
+                       uint64_t           ts_ms,
+                       const std::string& now_str,
+                       const std::vector<unsigned char>& jpeg) override {
+    int s = insert_sleep_ms.load();
+    if (s > 0) std::this_thread::sleep_for(std::chrono::milliseconds(s));
+    MockBackend::write_thumbnail(thumb_id, event_id, camera_ip,
+                                 ts_ms, now_str, jpeg);
+  }
+};
+
+static void test_msr_burst_coalesces_under_slow_msr_and_db() {
+  auto backend = std::make_unique<SlowMockBackend>();
+  SlowMockBackend* bptr = backend.get();
+  bptr->insert_sleep_ms.store(20);  // make DB slow too
+
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+
+  // MSR client with slow perform-fn so each call takes 80 ms.  Without
+  // burst-window coalescing this would be 3 × 80 ms = 240 ms of MSR work
+  // on the camera thread (one call per STARTED detection).
+  onvif::MsrClient msr("http://127.0.0.1:65535");  // url non-empty; perform-fn replaces curl
+  burst_test::calls_seen.store(0);
+  msr.set_perform_fn_for_testing(&burst_test::slow_perform);
+  msr.set_serialize(true);  // single-flight matches production setup
+
+  recorder.set_msr_client(&msr);
+  recorder.set_msr_drop_on_failure(true);
+  recorder.set_msr_burst_window_ms(5000);
+
+  // Three STARTED+ENDED Human detections from one camera, ~5s apart so
+  // the DB-level coalesce window groups them, and well within the 5 s
+  // burst window so MSR-level coalesce reuses the id.
+  auto jpeg = load_file(source_dir() + "testdata/snapshot_108.jpg");
+  SnapshotSyntheticEmulator emu("192.168.1.205",
+    {make_field_detector_response("Human", true,  "2026-03-22T10:00:00Z"),
+     make_field_detector_response("Human", false, "2026-03-22T10:00:01Z"),
+     make_field_detector_response("Human", true,  "2026-03-22T10:00:02Z"),
+     make_field_detector_response("Human", false, "2026-03-22T10:00:03Z"),
+     make_field_detector_response("Human", true,  "2026-03-22T10:00:04Z"),
+     make_field_detector_response("Human", false, "2026-03-22T10:00:05Z")},
+    jpeg);
+  emu.start();
+
+  // Register a MAC so MSR is actually called (the StoreSnapshot path
+  // skips when cam_mac is empty).
+  onvif::CameraConfig cfg;
+  cfg.ip                 = emu.local_address();
+  cfg.user               = "admin";
+  cfg.password           = "password";
+  cfg.snapshot_url       = emu.snapshot_url();
+  cfg.mac                = "AABBCCDDEE05";
+  cfg.retry_interval_sec = 1;
+  recorder.set_snapshot(cfg);
+
+  bool ok = run_single_camera(emu, recorder, /*needed=*/6);
+  CHECK(ok, "burst_window: timed out waiting for events");
+
+  // Burst-coalesce assertion: only the FIRST STARTED detection touches
+  // MSR; the 2nd and 3rd reuse the cached id.  Total MSR perform calls
+  // must be 1 even though 3 STARTED events fired and DB writes were
+  // intentionally slow.
+  const int actual_msr_calls = burst_test::calls_seen.load();
+  CHECK(actual_msr_calls == 1,
+        "burst_window: expected 1 actual MSR call, got "
+        + std::to_string(actual_msr_calls));
+
+  const uint64_t reuses = recorder.msr_burst_reuses_for_testing();
+  CHECK(reuses == 2,
+        "burst_window: expected 2 burst-reuses, got "
+        + std::to_string(reuses));
+
+  // Each event still produced its own SDO row — coalescing happens at
+  // the MSR layer, not at the DB-row layer.  3 STARTED detections
+  // ⇒ at least 3 person SDOs.
+  int person_sdo = 0;
+  for (auto& s : bptr->sdos) if (s.obj_type == "person") ++person_sdo;
+  CHECK(person_sdo >= 3,
+        "burst_window: expected >=3 person SDO rows, got "
+        + std::to_string(person_sdo));
+
+  // All thumbnail references should point at the cached MSR id — no
+  // local thumbnails table inserts because msr_drop_on_failure=true and
+  // MSR succeeded every time.
+  CHECK(bptr->thumbs.empty(),
+        "burst_window: no DB thumbnails should be written when MSR "
+        "stored every snapshot, got "
+        + std::to_string(bptr->thumbs.size()));
+  for (auto& e : bptr->events) {
+    CHECK(e.thumb_id == "BURST-IDOK",
+          "burst_window: event row " + e.id +
+          " should reference cached MSR id, got " + e.thumb_id);
+  }
+}
+
+// Companion test: with burst-window disabled (=0, the legacy default),
+// every STARTED detection makes its own MSR call.  Same scenario as
+// above but with the flag off — proves the previous behaviour is
+// preserved when the new feature is opted out.
+static void test_msr_burst_disabled_falls_back_to_per_event() {
+  auto backend = std::make_unique<SlowMockBackend>();
+
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+
+  onvif::MsrClient msr("http://127.0.0.1:65535");
+  burst_test::calls_seen.store(0);
+  msr.set_perform_fn_for_testing(&burst_test::slow_perform);
+  // serialize off so the legacy concurrent path is used.
+  msr.set_serialize(false);
+
+  recorder.set_msr_client(&msr);
+  recorder.set_msr_drop_on_failure(true);
+  recorder.set_msr_burst_window_ms(0);  // disabled → legacy behaviour
+
+  auto jpeg = load_file(source_dir() + "testdata/snapshot_108.jpg");
+  SnapshotSyntheticEmulator emu("192.168.1.206",
+    {make_field_detector_response("Human", true,  "2026-03-22T10:00:00Z"),
+     make_field_detector_response("Human", false, "2026-03-22T10:00:01Z"),
+     make_field_detector_response("Human", true,  "2026-03-22T10:00:02Z"),
+     make_field_detector_response("Human", false, "2026-03-22T10:00:03Z")},
+    jpeg);
+  emu.start();
+
+  onvif::CameraConfig cfg;
+  cfg.ip                 = emu.local_address();
+  cfg.user               = "admin";
+  cfg.password           = "password";
+  cfg.snapshot_url       = emu.snapshot_url();
+  cfg.mac                = "AABBCCDDEE06";
+  cfg.retry_interval_sec = 1;
+  recorder.set_snapshot(cfg);
+
+  bool ok = run_single_camera(emu, recorder, /*needed=*/4);
+  CHECK(ok, "burst_disabled: timed out");
+
+  // 2 STARTED events with burst-window=0 ⇒ 2 MSR calls.
+  const int calls = burst_test::calls_seen.load();
+  CHECK(calls == 2,
+        "burst_disabled: expected 2 MSR calls (legacy path), got "
+        + std::to_string(calls));
+  CHECK(recorder.msr_burst_reuses_for_testing() == 0,
+        "burst_disabled: expected 0 burst-reuses");
+}
+
+// ============================================================
 // main
 // ============================================================
 int main() {
@@ -2359,6 +2557,10 @@ int main() {
   run_test("rate_limit",                 [] { test_rate_limit(); });
   run_test("purge_orphaned_rows",        [] { test_purge_orphaned_rows(); });
   run_test("purge_stale_open_events",    [] { test_purge_stale_open_events(); });
+  run_test("msr_burst_coalesces_under_slow_msr_and_db",
+           [] { test_msr_burst_coalesces_under_slow_msr_and_db(); });
+  run_test("msr_burst_disabled_falls_back_to_per_event",
+           [] { test_msr_burst_disabled_falls_back_to_per_event(); });
 
   onvif::global_cleanup();
 

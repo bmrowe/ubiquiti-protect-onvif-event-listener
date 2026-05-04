@@ -17,9 +17,11 @@
 #include <curl/curl.h>
 
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <utility>
 
@@ -209,11 +211,98 @@ std::string parse_store_response(const void* msg, std::size_t msg_len) {
 
 MsrClient::MsrClient(std::string url) : url_(std::move(url)) {}
 
+void MsrClient::set_serialize(bool on) {
+  serialize_.store(on);
+}
+
+void MsrClient::set_suspend_cooldown(int sec) {
+  cooldown_ms_.store(sec > 0 ? sec * 1000 : 0);
+}
+
+void MsrClient::set_clock_for_testing(std::int64_t (*now_ms)()) {
+  clock_fn_ = now_ms;
+}
+
+void MsrClient::set_perform_fn_for_testing(MsrClient::PerformFn fn) {
+  perform_fn_ = fn;
+}
+
+void MsrClient::set_suspended_for_testing(bool s) {
+  suspended_.store(s);
+}
+
+void MsrClient::set_last_failure_for_testing(std::int64_t ms) {
+  last_failure_ms_.store(ms);
+}
+
+std::int64_t MsrClient::perform_count_for_testing() const {
+  return perform_count_.load();
+}
+
+namespace {
+
+std::int64_t monotonic_ms() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+}  // namespace
+
 std::string MsrClient::StoreSnapshot(const std::string& mac,
                                      const void* jpeg,
                                      std::size_t jpeg_len) {
   if (url_.empty() || mac.empty() || jpeg == nullptr || jpeg_len == 0) {
     return "";
+  }
+
+  // Cool-down skip: if we're suspended and the cool-down window has not
+  // elapsed since the last failure, don't even try.  Avoids piling up
+  // doomed curl handles when MSR is overloaded.
+  const int cooldown_ms = cooldown_ms_.load();
+  if (cooldown_ms > 0 && suspended_.load()) {
+    const std::int64_t now =
+        clock_fn_ ? clock_fn_() : monotonic_ms();
+    const std::int64_t last_fail = last_failure_ms_.load();
+    if (now - last_fail < cooldown_ms) {
+      return "";
+    }
+    // Cool-down has elapsed — fall through and probe MSR with one call.
+  }
+
+  // Single-flight: when enabled, only one StoreSnapshot runs at a time
+  // across the whole process.  This caps MSR-bound traffic from us at
+  // 1 in-flight, which is what MSR (and Protect, sharing the same
+  // service) needs to stay responsive on a busy router.
+  std::unique_lock<std::mutex> serialize_lk;
+  if (serialize_.load()) {
+    serialize_lk = std::unique_lock<std::mutex>(single_flight_mu_);
+  }
+
+  perform_count_.fetch_add(1);
+
+  // Test hook: short-circuit before any libcurl work.  Connection-state
+  // bookkeeping still runs so cool-down behaviour can be exercised.
+  if (perform_fn_ != nullptr) {
+    std::string id = perform_fn_(
+        mac,
+        std::string(static_cast<const char*>(jpeg), jpeg_len));
+    constexpr int kSuspendThreshold = 5;
+    if (id.empty()) {
+      last_failure_ms_.store(clock_fn_ ? clock_fn_() : monotonic_ms());
+      int n = consecutive_failures_.fetch_add(1) + 1;
+      if (n == kSuspendThreshold && !suspended_.exchange(true)) {
+        LOG(WARNING) << "[msr] forwarding suspended after " << n
+                     << " consecutive failures to " << url_;
+      }
+      return "";
+    }
+    consecutive_failures_.store(0);
+    if (suspended_.exchange(false)) {
+      LOG(INFO) << "[msr] forwarding resumed: " << url_;
+    } else if (!seen_first_success_.exchange(true)) {
+      LOG(INFO) << "[msr] connected to " << url_;
+    }
+    return id;
   }
 
   std::string body =
@@ -269,6 +358,7 @@ std::string MsrClient::StoreSnapshot(const std::string& mac,
   // (or first-success "connected") line and resets the counter.
   constexpr int kSuspendThreshold = 5;
   auto note_failure = [this]() {
+    last_failure_ms_.store(clock_fn_ ? clock_fn_() : monotonic_ms());
     int n = consecutive_failures_.fetch_add(1) + 1;
     if (n == kSuspendThreshold && !suspended_.exchange(true)) {
       LOG(WARNING) << "[msr] forwarding suspended after " << n

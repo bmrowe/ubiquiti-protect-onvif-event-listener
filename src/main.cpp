@@ -131,6 +131,34 @@ ABSL_FLAG(std::string, msr_url, "http://127.0.0.1:7700",
     "indistinguishable from first-party camera thumbnails in the "
     "Protect UI.  Default 'http://127.0.0.1:7700' works out of the box "
     "on UniFi Dream Routers/NVRs; set to empty string to disable.");
+ABSL_FLAG(bool, msr_serialize, true,
+    "When true (default), only one MSR StoreSnapshots call is in "
+    "flight at a time across the whole process.  Caps our submitted "
+    "load on MSR's image-processing thread pool at 1 of 128 slots, "
+    "leaving the rest available for Protect's own video-segment "
+    "queries.  Set to false to revert to the legacy concurrent path "
+    "(every camera thread can hit MSR simultaneously).");
+ABSL_FLAG(int32_t, msr_suspend_cooldown_sec, 30,
+    "When > 0 and the MSR client has entered the 'suspended' state "
+    "(5 consecutive failures), subsequent calls return empty without "
+    "contacting MSR until this many seconds have elapsed since the "
+    "last failure.  Prevents us from continuing to pile failed RPCs "
+    "onto an already-overloaded MSR.  Set to 0 to revert to legacy "
+    "behaviour (every call attempts MSR even while suspended).");
+ABSL_FLAG(bool, msr_drop_on_failure, true,
+    "When true (default), an MSR StoreSnapshots failure causes the "
+    "thumbnail to be dropped entirely instead of falling back to a "
+    "direct INSERT into Protect's `thumbnails` table.  The legacy "
+    "fallback compounded DB contention exactly when MSR was already "
+    "stalled — see issue #24.  Set to false to restore the legacy "
+    "fallback path.");
+ABSL_FLAG(int32_t, msr_burst_window_ms, 2000,
+    "Burst-coalesce window in milliseconds: when a successful MSR id "
+    "is cached for a camera within this window, subsequent detections "
+    "for the same camera reuse the cached id instead of calling MSR "
+    "again.  Each detection still produces its own DB rows; only the "
+    "MSR snapshot upload is coalesced.  Set to 0 to disable (legacy "
+    "behaviour: every detection makes its own MSR call).");
 ABSL_FLAG(int32_t, backfill_msr_thumbnails, 60,
     "Migrate pre-MSR third-party thumbnails from the `thumbnails` table "
     "into native MSR-backed storage by re-uploading each JPEG via "
@@ -845,8 +873,23 @@ int main(int argc, char* argv[]) {
     const std::string msr_url = absl::GetFlag(FLAGS_msr_url);
     if (!msr_url.empty()) {
       msr_client = std::make_unique<onvif::MsrClient>(msr_url);
+      // Apply the issue-#24 protections: single-flight, cool-down, and
+      // burst-window coalescing.  All three are flag-gated so an
+      // operator can revert to the legacy concurrent path.
+      const bool serialize     = absl::GetFlag(FLAGS_msr_serialize);
+      const int  cooldown_sec  = absl::GetFlag(FLAGS_msr_suspend_cooldown_sec);
+      const bool drop_on_fail  = absl::GetFlag(FLAGS_msr_drop_on_failure);
+      const int  burst_ms      = absl::GetFlag(FLAGS_msr_burst_window_ms);
+      msr_client->set_serialize(serialize);
+      msr_client->set_suspend_cooldown(cooldown_sec);
       det_rec.set_msr_client(msr_client.get());
-      LOG(INFO) << "[msr] StoreSnapshots forwarding enabled: " << msr_url;
+      det_rec.set_msr_drop_on_failure(drop_on_fail);
+      det_rec.set_msr_burst_window_ms(burst_ms > 0 ? burst_ms : 0);
+      LOG(INFO) << "[msr] StoreSnapshots forwarding enabled: " << msr_url
+                << " serialize=" << (serialize ? "on" : "off")
+                << " cooldown_sec=" << cooldown_sec
+                << " drop_on_failure=" << (drop_on_fail ? "on" : "off")
+                << " burst_window_ms=" << burst_ms;
     }
   }
 

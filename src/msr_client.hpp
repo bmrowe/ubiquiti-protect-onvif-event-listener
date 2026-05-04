@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <string>
 
 namespace onvif {
@@ -32,7 +33,11 @@ namespace onvif {
  * UI serves via MSP TCP on port 7701 — indistinguishable from first-party
  * camera thumbnails.
  *
- * Thread-safe: StoreSnapshot() uses a fresh curl handle per call.
+ * Thread-safe: StoreSnapshot() uses a fresh curl handle per call.  When
+ * single-flight is enabled (set_serialize(true)) calls are also globally
+ * serialised by a mutex so MSR sees at most one in-flight StoreSnapshots
+ * from this process — preventing us from saturating MSR's worker pool and
+ * indirectly stalling Protect's own video-segment queries.
  */
 class MsrClient {
  public:
@@ -45,8 +50,63 @@ class MsrClient {
   std::string StoreSnapshot(const std::string& mac,
                             const void* jpeg, std::size_t jpeg_len);
 
+  // When true, only one StoreSnapshot call may execute at a time across
+  // all threads; concurrent callers block on a mutex.  Default false
+  // (backwards-compatible: every caller runs concurrently).
+  void set_serialize(bool on);
+
+  // When > 0 and the client has entered the "suspended" state (5 consecutive
+  // failures), subsequent calls return "" immediately without contacting MSR
+  // until @p sec seconds have elapsed since the last failure.  After the
+  // cool-down a single probe call is allowed; success clears suspension,
+  // failure restarts the cool-down.  Default 0 (cool-down disabled — every
+  // call attempts MSR even while suspended).
+  void set_suspend_cooldown(int sec);
+
+  // Test hook: override the wall-clock source used for cool-down checks.
+  // Returns milliseconds since some epoch.  Default uses CLOCK_MONOTONIC.
+  void set_clock_for_testing(std::int64_t (*now_ms)());
+
+  // Test hook: replaces the curl/network call.  When set, StoreSnapshot
+  // calls @p fn(mac, jpeg) after the mutex + cool-down gates and treats
+  // its return as the gRPC response id (empty = failure).  Test fixtures
+  // use this to exercise serialisation and cool-down without standing
+  // up an MSR fake.  Pass nullptr to clear.
+  using PerformFn = std::string (*)(
+      const std::string& mac, const std::string& jpeg);
+  void set_perform_fn_for_testing(PerformFn fn);
+
+  // Test hook: force the suspended state so tests can verify the cool-down
+  // skip without making 5 real failures.
+  void set_suspended_for_testing(bool s);
+
+  // Test hook: directly seed the last-failure timestamp (ms).
+  void set_last_failure_for_testing(std::int64_t ms);
+
+  // Test observability: number of times a real network/perform call was
+  // attempted (i.e. mutex acquired and not skipped by cool-down).
+  std::int64_t perform_count_for_testing() const;
+
  private:
   std::string url_;
+
+  // Single-flight mutex: held for the entire StoreSnapshot call (curl
+  // perform + response parse) when serialize_ is true.  Recursive locking
+  // is impossible — one camera thread, one acquisition.
+  std::mutex single_flight_mu_;
+  std::atomic<bool> serialize_{false};
+
+  // Cool-down: when > 0 ms and suspended_ is true, skip calls until
+  // last_failure_ms_ + cooldown_ms_ has elapsed.
+  std::atomic<int>  cooldown_ms_{0};
+  std::atomic<std::int64_t> last_failure_ms_{0};
+
+  // Test hook: see set_clock_for_testing().
+  std::int64_t (*clock_fn_)() = nullptr;
+
+  // Test hook: see set_perform_fn_for_testing().
+  PerformFn perform_fn_{nullptr};
+  std::atomic<std::int64_t> perform_count_{0};
 
   // Connection-state diagnostics: one log line on first successful store
   // ("connected to <url>"), one on transition into the "suspended" state

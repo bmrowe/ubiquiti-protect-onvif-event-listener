@@ -177,6 +177,7 @@ cc_test(
     deps = [
         "//:alarm_notifier",
         "//:detection_recorder",
+        "//:msr_client",
         "//:ubv_thumbnail",
         ":camera_emulators",
         ":onvif_camera_emulator",
