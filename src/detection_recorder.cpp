@@ -1160,7 +1160,15 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
       //      re-open the last event so back-to-back detections merge naturally.
       // We don't return early: an SDO + detection labels are still inserted so
       // each detection occurrence is recorded within the coalesced event.
-      if (coalesce_window_ms_ > 0) {
+      // Resolve the per-camera coalesce window: --camera_coalesce_window_sec
+      // can bump (or drop) the window for a noisy camera (#29).
+      uint64_t cam_coalesce_ms = coalesce_window_ms_;
+      {
+        auto cit = camera_coalesce_window_ms_.find(ev.camera_ip);
+        if (cit != camera_coalesce_window_ms_.end())
+          cam_coalesce_ms = cit->second;
+      }
+      if (cam_coalesce_ms > 0) {
         auto oit = open_.find(key);
         if (oit != open_.end()) {
           // Case 1: event is still open — reuse it without touching last_event_.
@@ -1171,7 +1179,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
           if (lei != last_event_.end() && lei->second.real_end_ms > 0) {
             const uint64_t cur = util::now_ms();
             if (cur >= lei->second.real_end_ms &&
-                cur - lei->second.real_end_ms <= coalesce_window_ms_) {
+                cur - lei->second.real_end_ms <= cam_coalesce_ms) {
               coalesced_event_id = lei->second.event_id;
               open_[key] = coalesced_event_id;
               lei->second.real_end_ms = 0;  // mark as re-opened
@@ -1200,6 +1208,19 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
         snap_url  = it->second.url;
         snap_user = it->second.user;
         snap_pass = it->second.password;
+      }
+      // --camera_snapshot_urls override: rewrite the snapshot URL to
+      // http://<camera_ip><path> (auth from the original cam config still
+      // applies).  Useful when the ONVIF-advertised snapshotUrl is wrong,
+      // e.g. some Dahuas advertise /onvif/snapshot which 404s while
+      // /cgi-bin/snapshot.cgi works (#32).
+      {
+        auto pit = camera_snapshot_url_paths_.find(ev.camera_ip);
+        if (pit != camera_snapshot_url_paths_.end() && !pit->second.empty()) {
+          const std::string& path = pit->second;
+          snap_url = "http://" + ev.camera_ip +
+              (path.empty() || path[0] == '/' ? path : "/" + path);
+        }
       }
       auto cit = camera_ids_.find(ev.camera_ip);
       if (cit != camera_ids_.end()) cam_uuid = cit->second;
@@ -1575,6 +1596,24 @@ void DetectionRecorder::set_camera_object_type(const std::string& ip,
                                                 const std::string& type) {
   absl::MutexLock lk(&mu_);
   camera_object_types_[ip] = type;
+}
+
+void DetectionRecorder::set_camera_coalesce_window(const std::string& ip,
+                                                    uint32_t sec) {
+  absl::MutexLock lk(&mu_);
+  if (sec == 0)
+    camera_coalesce_window_ms_.erase(ip);
+  else
+    camera_coalesce_window_ms_[ip] = static_cast<uint64_t>(sec) * 1000;
+}
+
+void DetectionRecorder::set_camera_snapshot_url_path(const std::string& ip,
+                                                     const std::string& path) {
+  absl::MutexLock lk(&mu_);
+  if (path.empty())
+    camera_snapshot_url_paths_.erase(ip);
+  else
+    camera_snapshot_url_paths_[ip] = path;
 }
 
 }  // namespace onvif

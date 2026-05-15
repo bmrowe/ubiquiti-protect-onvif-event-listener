@@ -2093,6 +2093,66 @@ static void test_coalesce_window() {
 }
 
 // ============================================================
+// camera_coalesce_window_override: per-camera coalesce window from
+// --camera_coalesce_window_sec wins over the global setting (#29).
+//
+// Two cameras emit start/end events with a 100 ms simulated gap.  The
+// global coalesce_window is 0 (off) so the second event would normally
+// create a new row, but cameraA has a per-camera override that should
+// merge it.  cameraB has no override and falls through to the global
+// (no coalesce) behaviour.
+// ============================================================
+static void test_camera_coalesce_window_override() {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false,
+          std::string("camera_coalesce_window_override: ")
+              + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_coalesce_window(0);                       // global: off
+  recorder.set_camera_coalesce_window("192.168.1.A", 3600);  // 1 h for A
+  // B has no per-camera override -> falls back to the global 0 (no coalesce)
+
+  auto make_ev = [](const std::string& ip, bool started) {
+    onvif::OnvifEvent ev;
+    ev.camera_ip   = ip;
+    ev.topic       = "tns1:RuleEngine/FieldDetector/ObjectsInside";
+    ev.event_time  = "2026-03-31T10:00:00Z";
+    ev.property_op = "Changed";
+    ev.source["Rule"]   = "Human";
+    ev.data["IsInside"] = started ? "true" : "false";
+    return ev;
+  };
+
+  // cameraA: should coalesce
+  recorder.on_event(make_ev("192.168.1.A", true));
+  recorder.on_event(make_ev("192.168.1.A", false));
+  recorder.on_event(make_ev("192.168.1.A", true));
+  size_t evs_a = 0;
+  for (const auto& e : bptr->events) if (e.camera_ip == "192.168.1.A") ++evs_a;
+  CHECK(evs_a == 1,
+        "camera_coalesce_window_override: cameraA should have 1 event "
+        "(coalesced via per-camera window), got "
+        + std::to_string(evs_a));
+
+  // cameraB: should NOT coalesce (no override, global is off)
+  recorder.on_event(make_ev("192.168.1.B", true));
+  recorder.on_event(make_ev("192.168.1.B", false));
+  recorder.on_event(make_ev("192.168.1.B", true));
+  size_t evs_b = 0;
+  for (const auto& e : bptr->events) if (e.camera_ip == "192.168.1.B") ++evs_b;
+  CHECK(evs_b == 2,
+        "camera_coalesce_window_override: cameraB should have 2 events "
+        "(no per-camera override, global coalesce off), got "
+        + std::to_string(evs_b));
+}
+
+// ============================================================
 // coalesce_history: pre-existing events in the DB merged on startup.
 //
 // Pre-loads 3 ended events for the same camera+type with sub-window gaps,
@@ -2553,6 +2613,8 @@ int main() {
   run_test("alarm_notify_animal",        [] { test_alarm_notify_animal(); });
   run_test("alt_port_camera",            [&] { test_alt_port_camera(ubv_dir); });
   run_test("coalesce_window",            [] { test_coalesce_window(); });
+  run_test("camera_coalesce_window_override",
+           [] { test_camera_coalesce_window_override(); });
   run_test("coalesce_history",           [] { test_coalesce_history(); });
   run_test("rate_limit",                 [] { test_rate_limit(); });
   run_test("purge_orphaned_rows",        [] { test_purge_orphaned_rows(); });

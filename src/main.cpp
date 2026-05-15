@@ -31,6 +31,7 @@
 #include <csignal>
 #include <chrono>  // NOLINT(build/c++11)
 #include <fstream>
+#include <functional>
 #include <map>
 #include <memory>
 #include <set>
@@ -187,6 +188,19 @@ ABSL_FLAG(std::string, camera_object_types, "",
     "e.g. '192.168.1.108=animal,192.168.1.109=package'. "
     "Overrides the detection type for all events from that camera. "
     "Valid types: person, vehicle, animal, package.");
+ABSL_FLAG(std::string, camera_coalesce_window_sec, "",
+    "Per-camera coalesce-window overrides as comma-separated ip=sec pairs, "
+    "e.g. '192.168.1.108=120,192.168.1.109=60'. "
+    "Overrides --coalesce_window_sec for that camera only.  Useful for "
+    "noisy cameras whose onboard tracker briefly loses sight and re-fires "
+    "events as 'new' tracks (issue #29).");
+ABSL_FLAG(std::string, camera_snapshot_urls, "",
+    "Per-camera snapshot path overrides as comma-separated ip=path pairs, "
+    "e.g. '192.168.1.107=/cgi-bin/snapshot.cgi'. "
+    "Useful for cameras whose ONVIF-advertised snapshotUrl is wrong "
+    "(common on Dahua, see issue #32).  The path is appended to "
+    "http://<camera_ip>/ and authenticated with the camera's username "
+    "and password from the Protect cameras table.");
 ABSL_FLAG(std::string, rtsp_audio, "",
     "Set enableRtspAudio in the Protect database for all adopted third-party "
     "cameras that have audio capability (hasAudio=true). "
@@ -621,19 +635,39 @@ int main(int argc, char* argv[]) {
 
   // Object type configuration.
   det_rec.set_default_object_type(absl::GetFlag(FLAGS_default_object_type));
-  {
-    const std::string cam_types = absl::GetFlag(FLAGS_camera_object_types);
+
+  // Helper to walk a comma-separated `ip=value` list and call a per-pair
+  // callback.  Used by --camera_object_types / --camera_coalesce_window_sec
+  // / --camera_snapshot_urls below.
+  auto for_each_ip_value =
+      [&](const std::string& csv,
+          const std::function<void(const std::string&,
+                                   const std::string&)>& fn) {
     size_t pos = 0;
-    while (pos < cam_types.size()) {
-      size_t comma = cam_types.find(',', pos);
-      if (comma == std::string::npos) comma = cam_types.size();
-      const std::string pair = cam_types.substr(pos, comma - pos);
+    while (pos < csv.size()) {
+      size_t comma = csv.find(',', pos);
+      if (comma == std::string::npos) comma = csv.size();
+      const std::string pair = csv.substr(pos, comma - pos);
       const size_t eq = pair.find('=');
       if (eq != std::string::npos)
-        det_rec.set_camera_object_type(pair.substr(0, eq), pair.substr(eq + 1));
+        fn(pair.substr(0, eq), pair.substr(eq + 1));
       pos = comma + 1;
     }
-  }
+  };
+
+  for_each_ip_value(absl::GetFlag(FLAGS_camera_object_types),
+      [&](const std::string& ip, const std::string& v) {
+        det_rec.set_camera_object_type(ip, v);
+      });
+  for_each_ip_value(absl::GetFlag(FLAGS_camera_coalesce_window_sec),
+      [&](const std::string& ip, const std::string& v) {
+        const uint32_t sec = static_cast<uint32_t>(std::atoi(v.c_str()));
+        det_rec.set_camera_coalesce_window(ip, sec);
+      });
+  for_each_ip_value(absl::GetFlag(FLAGS_camera_snapshot_urls),
+      [&](const std::string& ip, const std::string& v) {
+        det_rec.set_camera_snapshot_url_path(ip, v);
+      });
 
   // Load NanoDet-M for thumbnail subject cropping, downloading if needed.
   std::unique_ptr<object_detect::ObjectDetector> detector;

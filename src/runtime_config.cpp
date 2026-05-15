@@ -54,6 +54,12 @@ const std::vector<Entry>& Schema() {
      "Per-camera type overrides as comma-separated ip=type pairs, e.g. "
      "192.168.1.108=person,192.168.1.109=vehicle.",
      "Detection"},
+    {"camera_coalesce_window_sec", Type::String,
+     "Per-camera coalesce-window overrides as comma-separated ip=sec pairs, "
+     "e.g. 192.168.1.108=120,192.168.1.109=60.  Bumping the window for a "
+     "noisy camera reduces duplicate events when its onboard tracker "
+     "briefly loses sight and re-fires (issue #29).",
+     "Detection"},
 
     // ---- First-party cameras ----
     {"first_party_cameras", Type::String,
@@ -72,6 +78,11 @@ const std::vector<Entry>& Schema() {
      "Set to 'enable' or 'disable' to flip RTSP audio on every "
      "audio-capable camera at startup.  Empty leaves the existing setting "
      "alone.",
+     "Cameras"},
+    {"camera_snapshot_urls", Type::String,
+     "Per-camera snapshot-path overrides as comma-separated ip=path pairs, "
+     "e.g. 192.168.1.107=/cgi-bin/snapshot.cgi.  Useful when the "
+     "ONVIF-advertised snapshotUrl is wrong (common on Dahua, issue #32).",
      "Cameras"},
 
     // ---- MSR forwarding ----

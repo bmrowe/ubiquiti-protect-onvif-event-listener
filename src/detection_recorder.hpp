@@ -166,6 +166,21 @@ class DetectionRecorder {
   /// Pass 0 to disable. Default: 30 s.
   void set_coalesce_window(uint32_t sec);
 
+  /// Per-camera override for the coalesce window.  Useful for noisy cameras
+  /// whose onboard tracker briefly loses sight and re-fires events as "new"
+  /// tracks (issue #29) -- bump the window for that camera without affecting
+  /// the others.  Pass @p sec = 0 to revert to the global window for the
+  /// camera.  Thread-safe.
+  void set_camera_coalesce_window(const std::string& camera_ip, uint32_t sec);
+
+  /// Per-camera override for the snapshot URL path.  When set, the recorder
+  /// fetches detection thumbnails from @c http://<camera_ip>@p path instead
+  /// of the URL advertised by the camera's ONVIF service (which is wrong on
+  /// some models -- common on Dahua, see issue #32).  Empty @p path removes
+  /// any prior override.  Thread-safe.
+  void set_camera_snapshot_url_path(const std::string& camera_ip,
+                                    const std::string& path);
+
   /// Drop new detection events from a camera once it has produced more than
   /// @p n events in the last rolling hour.  Pass 0 for unlimited. Default: 10.
   void set_max_events_per_hour(uint32_t n);
@@ -497,6 +512,15 @@ class DetectionRecorder {
 
   // Per-camera type overrides: all events from the keyed IP use this type.
   std::map<std::string, std::string> camera_object_types_;
+
+  // Per-camera coalesce-window overrides (in ms).  Looked up under mu_ in
+  // on_event(); absent entries fall back to coalesce_window_ms_.
+  std::map<std::string, uint64_t> camera_coalesce_window_ms_;
+
+  // Per-camera snapshot URL path overrides.  When present, on_event() rewrites
+  // the snapshot URL to http://<camera_ip><path> instead of using the URL the
+  // camera advertised via ONVIF.
+  std::map<std::string, std::string> camera_snapshot_url_paths_;
 
   // Coalescing: last completed event per (camera_ip, detection_type).
   // real_end_ms is the wall-clock time (ms) when the detection ended, without
