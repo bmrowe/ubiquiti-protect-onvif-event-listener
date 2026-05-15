@@ -175,10 +175,10 @@ struct ProtectGetResult {
 };
 ProtectGetResult perform_protect_get(const std::string& base_url,
                                      const std::string& user_id,
-                                     const std::string& thumb_id) {
+                                     const std::string& url_path) {
   ProtectGetResult out{0, {}};
   if (base_url.empty() || user_id.empty()) return out;
-  const std::string url = base_url + "/api/thumbnails/" + thumb_id;
+  const std::string url = base_url + url_path;
   std::string buf;
   CURL* curl = curl_easy_init();
   if (!curl) return out;
@@ -221,11 +221,35 @@ std::vector<uint8_t> fetch_thumbnail_via_protect(
     ProtectUserIdProvider* provider,
     const std::string& thumb_id) {
   if (base_url.empty() || !provider) return {};
-  ProtectGetResult r = perform_protect_get(base_url, provider->current(),
-                                            thumb_id);
+  const std::string path = "/api/thumbnails/" + thumb_id;
+  ProtectGetResult r = perform_protect_get(base_url, provider->current(), path);
   if (r.code == 401 && provider->try_refresh()) {
     LOG(INFO) << "[motion_poller] retrying thumbnail GET after user_id refresh";
-    r = perform_protect_get(base_url, provider->current(), thumb_id);
+    r = perform_protect_get(base_url, provider->current(), path);
+  }
+  return r.body;
+}
+
+// GET <protect_url>/api/cameras/<cam_id>/snapshot?ts=<ms>
+//
+// Returns the camera's full-FOV JPEG at @p ts_ms (or live frame if no
+// recording exists at that timestamp).  Used by the motion poller to look
+// at the moment the camera *actually* detected motion -- start + pre-pad
+// -- rather than Protect's cropped/late thumbnailId, which can pick a
+// 360x360 region around its guess at the motion centroid and miss the
+// subject when its algorithm is wrong.
+std::vector<uint8_t> fetch_camera_snapshot_at_ts(
+    const std::string& base_url,
+    ProtectUserIdProvider* provider,
+    const std::string& cam_id,
+    uint64_t ts_ms) {
+  if (base_url.empty() || !provider || cam_id.empty()) return {};
+  const std::string path = "/api/cameras/" + cam_id +
+                           "/snapshot?ts=" + std::to_string(ts_ms);
+  ProtectGetResult r = perform_protect_get(base_url, provider->current(), path);
+  if (r.code == 401 && provider->try_refresh()) {
+    LOG(INFO) << "[motion_poller] retrying snapshot GET after user_id refresh";
+    r = perform_protect_get(base_url, provider->current(), path);
   }
   return r.body;
 }
@@ -495,9 +519,17 @@ void MotionPoller::poll_loop() {
         PQclear(res_d);
       }
 
+      // Also pull the camera's prePaddingSecs from recordingSettings.
+      // events.start in Protect's schema is "first motion was detected
+      // minus prePaddingSecs"; the real motion moment is start + prePad.
+      // We use that to fetch a snapshot at the actual detection moment
+      // instead of Protect's chosen (often late / off-centre) thumbnail.
       PGresult* res = PQexecParams(impl_->conn,
-        "SELECT e.id, e.start, e.\"end\", e.\"cameraId\", e.\"thumbnailId\" "
-        "FROM events e "
+        "SELECT e.id, e.start, e.\"end\", e.\"cameraId\", e.\"thumbnailId\", "
+        "       COALESCE("
+        "         (c.\"recordingSettings\"::jsonb->>'prePaddingSecs')::int,"
+        "         2) AS pre_padding_secs "
+        "FROM events e JOIN cameras c ON c.id = e.\"cameraId\" "
         "WHERE e.type = 'motion' "
         "  AND e.\"cameraId\" = $1 "
         "  AND e.start > $2::bigint "
@@ -537,20 +569,46 @@ void MotionPoller::poll_loop() {
         // dumps that span versions.
         (void)PQgetvalue(res, i, 3);
         const std::string thumb_id   = PQgetvalue(res, i, 4);
+        int pre_padding_secs = std::atoi(PQgetvalue(res, i, 5));
+        if (pre_padding_secs < 0) pre_padding_secs = 0;
+        const uint64_t real_motion_start_ms =
+            start_ms + static_cast<uint64_t>(pre_padding_secs) * 1000;
 
         LOG(INFO) << "[motion_poller] processing motion event " << ev_id
                   << " camera=" << cam_id << " thumb=" << thumb_id
-                  << " start=" << start_ms << " end=" << end_ms;
+                  << " start=" << start_ms << " end=" << end_ms
+                  << " prePad=" << pre_padding_secs << "s"
+                  << " realStart=" << real_motion_start_ms;
 
-        // Fetch the thumbnail JPEG.  Protect routes thumbnailIds by
-        // length: 24-char IDs live in the `thumbnails` Postgres table;
-        // any other length (typically the MSR "{MAC}-{ts}" 26-char
-        // form Protect uses for native first-party cameras post 7.x)
-        // is stored as a UBV file served by the msp media server.
-        // Try the DB first for 24-char IDs; for the rest, hit the
-        // local Protect API which routes to msp transparently.
+        // First, fetch a full-FOV snapshot at the real motion start
+        // moment (start + prePaddingSecs).  This bypasses Protect's
+        // 360x360 cropping algorithm, which can put the crop window
+        // around its guess at the motion centroid and miss the actual
+        // subject -- the symptom in #19/#27 etc.  Protect's snapshot
+        // endpoint serves a historical frame from recording when one
+        // exists at the timestamp, falling back to live.
         std::vector<uint8_t> jpeg;
-        if (thumb_id.size() == 24) {
+        if (!impl_->protect_url.empty() &&
+            impl_->protect_user_id_provider) {
+          jpeg = fetch_camera_snapshot_at_ts(
+              impl_->protect_url, impl_->protect_user_id_provider,
+              cam_id, real_motion_start_ms);
+          if (!jpeg.empty())
+            LOG(INFO) << "[motion_poller] event " << ev_id
+                      << ": fetched full-FOV snapshot at ts="
+                      << real_motion_start_ms
+                      << " (" << jpeg.size() << " bytes)";
+        }
+
+        // Fallback: original thumbnail-by-id path.  Protect routes
+        // thumbnailIds by length: 24-char IDs live in the `thumbnails`
+        // Postgres table; any other length (typically the MSR
+        // "{MAC}-{ts}" 26-char form Protect uses for native first-
+        // party cameras post 7.x) is stored as a UBV file served by
+        // the msp media server.  Try the DB first for 24-char IDs;
+        // for the rest, hit the local Protect API which routes to
+        // msp transparently.
+        if (jpeg.empty() && thumb_id.size() == 24) {
           impl_->maybe_reconnect();
           const char* tp[] = { thumb_id.c_str() };
           PGresult* thumb_res = PQexecParams(impl_->conn,
@@ -565,9 +623,11 @@ void MotionPoller::poll_loop() {
             jpeg.assign(raw, raw + raw_len);
           }
           PQclear(thumb_res);
-        } else if (!impl_->protect_url.empty() &&
-                   impl_->protect_user_id_provider &&
-                   !impl_->protect_user_id_provider->empty()) {
+        }
+        if (jpeg.empty() && thumb_id.size() != 24 &&
+            !impl_->protect_url.empty() &&
+            impl_->protect_user_id_provider &&
+            !impl_->protect_user_id_provider->empty()) {
           // Non-24-char ID: msp-served UBV thumbnail.  Fetch via
           // Protect's local /api/thumbnails/<id> which dispatches to
           // msp and returns the JPEG bytes back to us.  401 -> the
@@ -691,6 +751,87 @@ void MotionPoller::poll_loop() {
             LOG(ERROR) << "[motion_poller] insert sdo: "
                        << PQerrorMessage(impl_->conn);
           PQclear(r);
+        }
+
+        // INSERT detectionLabels.  The /api/detection-search endpoint
+        // (Find Anything in the Web UI) does a GIN-index lookup on
+        // detectionLabels.labels; events without a row here are invisible
+        // to Web/iOS filters even when smartDetectTypes is set.
+        // detection_recorder.cpp writes these for third-party cameras;
+        // the motion poller has to do the same for first-party ones.
+        {
+          const std::string label_event_type =
+              std::string("eventType:smartDetectZone");
+          const std::string label_sdt = "smartDetectType:" + obj_type;
+          const std::string label_camera = "camera:" + cam_id;
+          const std::string label_zone = "zone:" + cam_id + ":1";
+
+          // Upsert all four labels in a single round-trip.
+          const char* up_p[] = {
+            label_event_type.c_str(), label_sdt.c_str(),
+            label_camera.c_str(),     label_zone.c_str()
+          };
+          PGresult* ur = PQexecParams(impl_->conn,
+            "INSERT INTO labels (id, name, \"createdAt\", \"updatedAt\") "
+            "VALUES (gen_random_uuid(), $1, NOW(), NOW()),"
+            "       (gen_random_uuid(), $2, NOW(), NOW()),"
+            "       (gen_random_uuid(), $3, NOW(), NOW()),"
+            "       (gen_random_uuid(), $4, NOW(), NOW()) "
+            "ON CONFLICT (name) DO NOTHING",
+            4, nullptr, up_p, nullptr, nullptr, 0);
+          if (PQresultStatus(ur) != PGRES_COMMAND_OK)
+            LOG(WARNING) << "[motion_poller] upsert labels: "
+                         << PQerrorMessage(impl_->conn);
+          PQclear(ur);
+
+          // Fetch the four lids in name order matching $1..$4.
+          int lids[4] = {0, 0, 0, 0};
+          PGresult* lr = PQexecParams(impl_->conn,
+            "SELECT lid, name FROM labels "
+            "WHERE name IN ($1, $2, $3, $4)",
+            4, nullptr, up_p, nullptr, nullptr, 0);
+          int n_lids = 0;
+          if (PQresultStatus(lr) == PGRES_TUPLES_OK) {
+            for (int i = 0; i < PQntuples(lr) && n_lids < 4; ++i) {
+              lids[n_lids++] = std::atoi(PQgetvalue(lr, i, 0));
+            }
+          } else {
+            LOG(WARNING) << "[motion_poller] select lids: "
+                         << PQerrorMessage(impl_->conn);
+          }
+          PQclear(lr);
+
+          if (n_lids == 4) {
+            // Insert event-level row (objectId IS NULL) and SDO-level row
+            // (objectId = sdo_id) in a single statement.
+            const std::string dl_event_id = util::generate_uuid();
+            const std::string dl_sdo_id   = util::generate_uuid();
+            const std::string l0 = std::to_string(lids[0]);
+            const std::string l1 = std::to_string(lids[1]);
+            const std::string l2 = std::to_string(lids[2]);
+            const std::string l3 = std::to_string(lids[3]);
+            const char* dlp[] = {
+              dl_event_id.c_str(), new_event_id.c_str(),
+              l0.c_str(), l1.c_str(), l2.c_str(), l3.c_str(),
+              now_str.c_str(), now_str.c_str(),
+              dl_sdo_id.c_str(), sdo_id.c_str()
+            };
+            PGresult* dlr = PQexecParams(impl_->conn,
+              "INSERT INTO \"detectionLabels\""
+              "  (id, \"eventId\", \"objectId\", labels,"
+              "   \"createdAt\", \"updatedAt\") "
+              "VALUES "
+              "  ($1, $2, NULL, "
+              "   ARRAY[$3::int,$4::int,$5::int,$6::int], $7, $8),"
+              "  ($9, $2, $10, "
+              "   ARRAY[$3::int,$4::int,$5::int,$6::int], $7, $8) "
+              "ON CONFLICT DO NOTHING",
+              10, nullptr, dlp, nullptr, nullptr, 0);
+            if (PQresultStatus(dlr) != PGRES_COMMAND_OK)
+              LOG(WARNING) << "[motion_poller] insert detectionLabels: "
+                           << PQerrorMessage(impl_->conn);
+            PQclear(dlr);
+          }
         }
 
         // INSERT smartDetectTracks.  Required for the iOS app's Find
