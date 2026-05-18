@@ -928,6 +928,10 @@ int main(int argc, char* argv[]) {
       det_rec.set_msr_client(msr_client.get());
       det_rec.set_msr_drop_on_failure(drop_on_fail);
       det_rec.set_msr_burst_window_ms(burst_ms > 0 ? burst_ms : 0);
+      // First-party path: motion_poller also routes thumbnails through MSR
+      // so its smartDetectZone events get MSR-format thumbnailIds (#16/#27).
+      if (motion_poller)
+        motion_poller->set_msr_client(msr_client.get());
       LOG(INFO) << "[msr] StoreSnapshots forwarding enabled: " << msr_url
                 << " serialize=" << (serialize ? "on" : "off")
                 << " cooldown_sec=" << cooldown_sec

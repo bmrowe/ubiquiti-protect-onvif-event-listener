@@ -32,6 +32,7 @@
 #include "absl/log/log.h"
 #include "alarm_notifier.hpp"
 #include "jpeg_crop.hpp"
+#include "msr_client.hpp"
 #include "object_detect.hpp"
 #include "protect_user_id_provider.hpp"
 #include "ubv_thumbnail.hpp"
@@ -272,6 +273,7 @@ struct MotionPoller::Impl {
   int poll_interval_sec{10};
   uint32_t coalesce_window_sec{30};
   bool use_msr_thumb_ids{false};
+  MsrClient* msr_client{nullptr};
 
   // UBV path cache: MAC -> (date string, file path).
   std::map<std::string, std::pair<std::string, std::string>> ubv_cache;
@@ -346,6 +348,10 @@ void MotionPoller::set_coalesce_window(uint32_t sec) {
 
 void MotionPoller::set_use_msr_thumbnail_ids(bool use_msr) {
   impl_->use_msr_thumb_ids = use_msr;
+}
+
+void MotionPoller::set_msr_client(MsrClient* msr) {
+  impl_->msr_client = msr;
 }
 
 void MotionPoller::set_protect_api(const std::string& url,
@@ -692,10 +698,6 @@ void MotionPoller::poll_loop() {
           if (mac_it != impl_->id_to_mac.end())
             cam_mac = mac_it->second;
         }
-        const std::string new_thumb_id =
-            (impl_->use_msr_thumb_ids && !cam_mac.empty())
-                ? util::make_msr_thumbnail_id(cam_mac, start_ms)
-                : util::generate_24hex_id();
         const std::string now_str      = util::utc_now_iso8601();
         const std::string start_str    = std::to_string(start_ms);
         const std::string end_str      = std::to_string(end_ms);
@@ -704,6 +706,33 @@ void MotionPoller::poll_loop() {
         // Crop the thumbnail using the detection bbox.
         std::vector<uint8_t> cropped = jpeg_crop::crop(jpeg, det->bbox);
         if (cropped.empty()) cropped = std::move(jpeg);
+
+        // Forward the cropped JPEG to MSR's StoreSnapshots when an MsrClient
+        // is wired in.  MSR persists the bytes as a native UBV file and
+        // returns a "{MAC}-{ms}" id that the msp media server serves; that
+        // format is what Protect 7.1+'s detection-search recognises, so
+        // first-party events finally surface in Find Anything once they're
+        // stored through this path (issue #16 / #27).  On MSR failure we
+        // fall through to the legacy DB-stored 24-char-hex id and the
+        // event remains queryable by ID even if the Web UI filter ignores
+        // it.
+        std::string new_thumb_id;
+        bool stored_by_msr = false;
+        if (impl_->msr_client && !cam_mac.empty()) {
+          new_thumb_id = impl_->msr_client->StoreSnapshot(
+              cam_mac, cropped.data(), cropped.size());
+          if (!new_thumb_id.empty()) {
+            stored_by_msr = true;
+            LOG(INFO) << "[motion_poller] event " << new_event_id
+                      << ": MSR stored snapshot as id=" << new_thumb_id;
+          }
+        }
+        if (new_thumb_id.empty()) {
+          new_thumb_id =
+              (impl_->use_msr_thumb_ids && !cam_mac.empty())
+                  ? util::make_msr_thumbnail_id(cam_mac, start_ms)
+                  : util::generate_24hex_id();
+        }
 
         // INSERT event.
         {
@@ -878,8 +907,11 @@ void MotionPoller::poll_loop() {
           PQclear(r);
         }
 
-        // INSERT thumbnail (cropped JPEG).
-        {
+        // INSERT thumbnail (cropped JPEG).  Skipped when MSR already
+        // persisted the bytes natively -- writing into the same `thumbnails`
+        // table that MSR/Protect own is the contention path that knocked
+        // Protect's UI offline in issue #24.
+        if (!stored_by_msr) {
           const int jpeg_len = static_cast<int>(cropped.size());
           const char* jpeg_ptr = reinterpret_cast<const char*>(cropped.data());
           const char* tp2[] = {

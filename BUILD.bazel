@@ -408,6 +408,7 @@ cc_library(
     deps = _CURL + [
         ":alarm_notifier",
         ":jpeg_crop",
+        ":msr_client",
         ":object_detect",
         ":protect_user_id_provider",
         ":ubv_thumbnail",

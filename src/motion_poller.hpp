@@ -62,6 +62,7 @@ std::string build_sdt_payload(uint64_t start_ms,
 }  // namespace motion_poller_internal
 
 class AlarmNotifier;
+class MsrClient;
 class ProtectUserIdProvider;
 
 /// Polls the UniFi Protect `events` table for `motion` events from first-party
@@ -108,6 +109,17 @@ class MotionPoller {
   /// When enabled, thumbnail IDs use the MSR "{MAC}-{timestamp_ms}" format
   /// matching native Protect.  Must be called before start().
   void set_use_msr_thumbnail_ids(bool use_msr);
+
+  /// MSR client for forwarding thumbnail JPEGs to MSR's
+  /// `RecordingAPI.StoreSnapshots` -- MSR persists the JPEG as a native UBV
+  /// file owned by ms:unifi-streaming, and the returned thumbnailId is
+  /// served by the msp media server.  When set (and the camera has a MAC),
+  /// the poller forwards the cropped JPEG to MSR and uses the returned id;
+  /// without an MsrClient, falls back to a 24-char-hex DB-stored thumbnail.
+  /// MSR-stored thumbnails are required for Protect 7.1+'s detection-search
+  /// to surface our events in the Find Anything filter (which expects the
+  /// MSR-format ids that first-party native AI events produce).
+  void set_msr_client(MsrClient* msr);
 
   /// Local Protect API base URL (e.g. "http://localhost:7080").  Used to
   /// fetch MSR-format thumbnails (length != 24) that are stored as
