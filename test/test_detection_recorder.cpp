@@ -72,6 +72,7 @@
 #include "alarm_notifier.hpp"
 #include "detection_recorder.hpp"
 #include "onvif_listener.hpp"
+#include "protect_version.hpp"
 #include "ubv_thumbnail.hpp"
 #include "camera_emulators.hpp"
 #include "onvif_camera_emulator.hpp"
@@ -449,10 +450,17 @@ struct MockBackend : onvif::DetectionRecorder::IDbBackend {
     std::string camera_ip;
   };
 
+  struct SdaRow {
+    std::string id;
+    std::string sdo_id;
+    int x1{0}, y1{0}, x2{0}, y2{0};
+  };
+
   std::vector<EventRow>   events;
   std::vector<SdoRow>     sdos;
   std::vector<SdrRow>     sdrs;
   std::vector<ThumbRow>   thumbs;
+  std::vector<SdaRow>     sdas;
   std::map<std::string, int> labels;      // name -> simulated lid
   std::vector<DetLabelRow>   det_labels;
 
@@ -467,11 +475,22 @@ struct MockBackend : onvif::DetectionRecorder::IDbBackend {
 
   bool needs_snapshot() const override { return true; }
 
+  // Last metadata + thumb_fullfov_id passed to insert_event.  Tests that
+  // exercise the rich (Protect 7.1+) path read these to assert the
+  // version-gated branch produced the right payload; legacy-path tests
+  // expect them to remain empty strings.
+  std::string last_event_metadata;
+  std::string last_event_thumb_fullfov_id;
+
   void insert_event(const std::string& id, uint64_t ts_ms,
                     const std::string& camera_ip, const std::string& sdt_json,
                     const std::string& thumb_id,
-                    const std::string& /*now_str*/) override {
+                    const std::string& /*now_str*/,
+                    const std::string& metadata,
+                    const std::string& thumb_fullfov_id) override {
     events.push_back({id, camera_ip, sdt_json, thumb_id, ts_ms, false, 0});
+    last_event_metadata          = metadata;
+    last_event_thumb_fullfov_id  = thumb_fullfov_id;
   }
 
   void insert_sdo(const std::string& id, const std::string& event_id,
@@ -504,6 +523,16 @@ struct MockBackend : onvif::DetectionRecorder::IDbBackend {
                                const std::string& obj_type,
                                const std::string& /*now_str*/) override {
     sdrs.push_back({id, camera_ip, obj_type, ts_ms});
+  }
+
+  void insert_smart_detect_object_area(
+      const std::string& id,
+      const std::string& sdo_id,
+      int bbox_x1, int bbox_y1, int bbox_x2, int bbox_y2,
+      uint64_t /*detected_at_ms*/,
+      uint64_t /*last_seen_ms*/,
+      const std::string& /*now_str*/) override {
+    sdas.push_back({id, sdo_id, bbox_x1, bbox_y1, bbox_x2, bbox_y2});
   }
 
   std::vector<int> upsert_labels(
@@ -2407,11 +2436,13 @@ struct SlowMockBackend : MockBackend {
                     const std::string& camera_ip,
                     const std::string& sdt_json,
                     const std::string& thumb_id,
-                    const std::string& now_str) override {
+                    const std::string& now_str,
+                    const std::string& metadata,
+                    const std::string& thumb_fullfov_id) override {
     int s = insert_sleep_ms.load();
     if (s > 0) std::this_thread::sleep_for(std::chrono::milliseconds(s));
     MockBackend::insert_event(id, ts_ms, camera_ip, sdt_json,
-                              thumb_id, now_str);
+                              thumb_id, now_str, metadata, thumb_fullfov_id);
   }
 
   void write_thumbnail(const std::string& thumb_id,
@@ -2575,6 +2606,86 @@ static void test_msr_burst_disabled_falls_back_to_per_event() {
 // ============================================================
 // main
 // ============================================================
+// ============================================================
+// Protect version gating: legacy sparse path stays unchanged on <7.1.0,
+// rich path fires on >=7.1.0.  The version is read from the
+// protect_version atomic global, which we drive directly from the test.
+// ============================================================
+static void test_version_gate_legacy_path_unchanged() {
+  // Simulate a controller running an older Protect (7.0.x).  Behaviour
+  // MUST be byte-identical to today's sparse path: empty metadata at the
+  // backend call site, no smartDetectObjectAreas row.
+  onvif::protect_version::ResetForTesting();
+  onvif::protect_version::SetCurrent({7, 0, 57});
+
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  CHECK(rec_or.ok(), "version_gate_legacy: CreateWithBackend failed");
+  onvif::DetectionRecorder& recorder = **rec_or;
+
+  onvif::OnvifEvent ev;
+  ev.camera_ip   = "192.168.1.250";
+  ev.topic       = "tns1:RuleEngine/FieldDetector/ObjectsInside";
+  ev.event_time  = "2026-05-23T10:00:00Z";
+  ev.property_op = "Changed";
+  ev.source["Rule"]      = "Human";
+  ev.data["IsInside"]    = "true";
+  recorder.on_event(ev);
+
+  CHECK(bptr->events.size() == 1, "version_gate_legacy: expected 1 event row");
+  CHECK(bptr->last_event_metadata.empty(),
+        "version_gate_legacy: metadata must be empty (PgBackend hardcodes sparse SQL)");
+  CHECK(bptr->last_event_thumb_fullfov_id.empty(),
+        "version_gate_legacy: thumbnailFullfovId must be empty");
+  CHECK(bptr->sdas.empty(),
+        "version_gate_legacy: smartDetectObjectAreas must NOT be inserted");
+
+  onvif::protect_version::ResetForTesting();
+}
+
+static void test_version_gate_rich_path_on_7_1() {
+  // Protect 7.1.47 controller -> rich-format writes.
+  onvif::protect_version::ResetForTesting();
+  onvif::protect_version::SetCurrent({7, 1, 47});
+
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  CHECK(rec_or.ok(), "version_gate_rich: CreateWithBackend failed");
+  onvif::DetectionRecorder& recorder = **rec_or;
+
+  onvif::OnvifEvent ev;
+  ev.camera_ip   = "192.168.1.251";
+  ev.topic       = "tns1:RuleEngine/FieldDetector/ObjectsInside";
+  ev.event_time  = "2026-05-23T10:00:00Z";
+  ev.property_op = "Changed";
+  ev.source["Rule"]      = "Human";
+  ev.data["IsInside"]    = "true";
+  recorder.on_event(ev);
+
+  CHECK(bptr->events.size() == 1, "version_gate_rich: expected 1 event row");
+  // Rich metadata payload includes the new shape.
+  CHECK(!bptr->last_event_metadata.empty(),
+        "version_gate_rich: metadata must be populated");
+  CHECK(bptr->last_event_metadata.find("detectedAreas") != std::string::npos,
+        "version_gate_rich: metadata must contain detectedAreas");
+  CHECK(bptr->last_event_metadata.find("detectedThumbnails") != std::string::npos,
+        "version_gate_rich: metadata must contain detectedThumbnails");
+  CHECK(bptr->last_event_metadata.find("zonesStatus") != std::string::npos,
+        "version_gate_rich: metadata must contain zonesStatus");
+  CHECK(bptr->last_event_metadata.find("\"temperature\":21.0") != std::string::npos,
+        "version_gate_rich: metadata must contain default weather");
+  CHECK(!bptr->last_event_thumb_fullfov_id.empty(),
+        "version_gate_rich: thumbnailFullfovId must be populated");
+  CHECK(bptr->sdas.size() == 1,
+        "version_gate_rich: smartDetectObjectAreas row must be inserted");
+  CHECK(bptr->sdas[0].sdo_id == bptr->sdos[0].id,
+        "version_gate_rich: SDA must FK to the inserted SDO");
+
+  onvif::protect_version::ResetForTesting();
+}
+
 int main() {
   const std::string ubv_dir = "/tmp/test_dr_thumbs";
 
@@ -2623,6 +2734,10 @@ int main() {
            [] { test_msr_burst_coalesces_under_slow_msr_and_db(); });
   run_test("msr_burst_disabled_falls_back_to_per_event",
            [] { test_msr_burst_disabled_falls_back_to_per_event(); });
+  run_test("version_gate_legacy_path_unchanged",
+           [] { test_version_gate_legacy_path_unchanged(); });
+  run_test("version_gate_rich_path_on_7_1",
+           [] { test_version_gate_rich_path_on_7_1(); });
 
   onvif::global_cleanup();
 

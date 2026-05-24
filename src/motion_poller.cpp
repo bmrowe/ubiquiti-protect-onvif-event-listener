@@ -31,10 +31,12 @@
 
 #include "absl/log/log.h"
 #include "alarm_notifier.hpp"
+#include "event_enricher.hpp"
 #include "jpeg_crop.hpp"
 #include "msr_client.hpp"
 #include "object_detect.hpp"
 #include "protect_user_id_provider.hpp"
+#include "protect_version.hpp"
 #include "ubv_thumbnail.hpp"
 #include "util.hpp"
 
@@ -280,6 +282,9 @@ struct MotionPoller::Impl {
 
   // High-water mark: last processed motion event start per camera.
   std::map<std::string, uint64_t> hwm;
+  int backfill_lookback_days{0};
+  bool always_smart_detect{true};
+  std::string fallback_object_type{"person"};
 
   ~Impl() {
     if (conn) PQfinish(conn);
@@ -338,6 +343,16 @@ void MotionPoller::set_ubv_dir(const std::string& dir) {
   impl_->ubv_dir = dir;
 }
 
+void MotionPoller::set_backfill_lookback_days(int days) {
+  impl_->backfill_lookback_days = std::max(0, days);
+}
+
+void MotionPoller::set_always_smart_detect(bool on,
+                                            const std::string& fallback) {
+  impl_->always_smart_detect = on;
+  impl_->fallback_object_type = fallback.empty() ? "person" : fallback;
+}
+
 void MotionPoller::set_poll_interval(int sec) {
   impl_->poll_interval_sec = sec;
 }
@@ -394,6 +409,27 @@ void MotionPoller::init_high_water_marks() {
     if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0)
       hwm = static_cast<uint64_t>(std::stoull(PQgetvalue(res, 0, 0)));
     PQclear(res);
+
+    // Optional backfill: pull the HWM back to (now - N days) so the live
+    // poll loop re-scans recent motion events that didn't produce a
+    // smartDetectZone before (typical reason: an older code path or a
+    // NanoDet miss).  The poll SELECT's NOT EXISTS smartDetectZone filter
+    // means we naturally skip events that already have one -- only the
+    // ones we previously missed get reprocessed.  Live SDZ events from
+    // less than 60s ago will still trigger automations (see ts_ms / alarm
+    // age check in the live processing loop); older ones won't.
+    if (impl_->backfill_lookback_days > 0) {
+      const uint64_t backfill_floor = util::now_ms()
+          - static_cast<uint64_t>(impl_->backfill_lookback_days) * 86'400'000ULL;
+      if (backfill_floor < hwm) {
+        LOG(INFO) << "[motion_poller] camera " << cam_id
+                  << " pulling hwm back from " << hwm
+                  << " to " << backfill_floor
+                  << " for " << impl_->backfill_lookback_days
+                  << "-day backfill scan";
+        hwm = backfill_floor;
+      }
+    }
 
     impl_->hwm[cam_id] = hwm;
     LOG(INFO) << "[motion_poller] camera " << cam_id
@@ -586,92 +622,111 @@ void MotionPoller::poll_loop() {
                   << " prePad=" << pre_padding_secs << "s"
                   << " realStart=" << real_motion_start_ms;
 
-        // First, fetch a full-FOV snapshot at the real motion start
-        // moment (start + prePaddingSecs).  This bypasses Protect's
-        // 360x360 cropping algorithm, which can put the crop window
-        // around its guess at the motion centroid and miss the actual
-        // subject -- the symptom in #19/#27 etc.  Protect's snapshot
-        // endpoint serves a historical frame from recording when one
-        // exists at the timestamp, falling back to live.
-        std::vector<uint8_t> jpeg;
-        if (!impl_->protect_url.empty() &&
-            impl_->protect_user_id_provider) {
-          jpeg = fetch_camera_snapshot_at_ts(
+        // Fetch TWO candidate images for NanoDet-M and try both:
+        //
+        //   A. /api/cameras/<id>/snapshot?ts=<ms>  -- wide-angle, but Protect
+        //      serves the Low channel (640x360) which leaves a mid-distance
+        //      person at ~50 px after NanoDet's 320x320 resize -- below the
+        //      0.4 confidence threshold.
+        //   B. /api/thumbnails/<id>                 -- 360x360 image cropped
+        //      tight around Protect's motion centroid.  Subject occupies far
+        //      more of the frame so NanoDet's resize keeps it ~150 px.
+        //
+        // Historically (pre-df276a9) we used only (B); first-party detections
+        // worked well.  df276a9 switched to (A) under the theory "we should
+        // see the full FOV so we don't miss off-centre subjects", but Protect
+        // ships only the low-res channel through that endpoint, killing
+        // detection rate.  The fix is to use whichever image NanoDet finds
+        // something in; if (B) has the centroid wrong, (A) covers the wider
+        // scene as a fallback.
+        std::vector<uint8_t> jpeg_wide;   // (A) wide 640x360
+        std::vector<uint8_t> jpeg_crop;   // (B) cropped 360x360
+
+        if (!impl_->protect_url.empty() && impl_->protect_user_id_provider) {
+          jpeg_wide = fetch_camera_snapshot_at_ts(
               impl_->protect_url, impl_->protect_user_id_provider,
               cam_id, real_motion_start_ms);
-          if (!jpeg.empty())
-            LOG(INFO) << "[motion_poller] event " << ev_id
-                      << ": fetched full-FOV snapshot at ts="
-                      << real_motion_start_ms
-                      << " (" << jpeg.size() << " bytes)";
         }
-
-        // Fallback: original thumbnail-by-id path.  Protect routes
-        // thumbnailIds by length: 24-char IDs live in the `thumbnails`
-        // Postgres table; any other length (typically the MSR
-        // "{MAC}-{ts}" 26-char form Protect uses for native first-
-        // party cameras post 7.x) is stored as a UBV file served by
-        // the msp media server.  Try the DB first for 24-char IDs;
-        // for the rest, hit the local Protect API which routes to
-        // msp transparently.
-        if (jpeg.empty() && thumb_id.size() == 24) {
+        // Thumbnail-by-id: 24-char IDs live in the `thumbnails` Postgres
+        // table; anything else (MSR "{MAC}-{ts}" form) is served by msp via
+        // /api/thumbnails/<id>.
+        if (thumb_id.size() == 24) {
           impl_->maybe_reconnect();
           const char* tp[] = { thumb_id.c_str() };
           PGresult* thumb_res = PQexecParams(impl_->conn,
             "SELECT content FROM thumbnails WHERE id = $1",
             1, nullptr, tp, nullptr, nullptr, 1);
-
           if (PQresultStatus(thumb_res) == PGRES_TUPLES_OK &&
               PQntuples(thumb_res) > 0 &&
               !PQgetisnull(thumb_res, 0, 0)) {
             const char* raw = PQgetvalue(thumb_res, 0, 0);
             const int raw_len = PQgetlength(thumb_res, 0, 0);
-            jpeg.assign(raw, raw + raw_len);
+            jpeg_crop.assign(raw, raw + raw_len);
           }
           PQclear(thumb_res);
-        }
-        if (jpeg.empty() && thumb_id.size() != 24 &&
-            !impl_->protect_url.empty() &&
-            impl_->protect_user_id_provider &&
-            !impl_->protect_user_id_provider->empty()) {
-          // Non-24-char ID: msp-served UBV thumbnail.  Fetch via
-          // Protect's local /api/thumbnails/<id> which dispatches to
-          // msp and returns the JPEG bytes back to us.  401 -> the
-          // provider re-discovers the user_id and we retry once.
-          jpeg = fetch_thumbnail_via_protect(
+        } else if (!impl_->protect_url.empty() &&
+                   impl_->protect_user_id_provider &&
+                   !impl_->protect_user_id_provider->empty()) {
+          jpeg_crop = fetch_thumbnail_via_protect(
               impl_->protect_url, impl_->protect_user_id_provider, thumb_id);
         }
 
-        if (jpeg.empty()) {
+        if (jpeg_wide.empty() && jpeg_crop.empty()) {
           LOG(INFO) << "[motion_poller] skip event " << ev_id
-                    << ": thumbnail " << thumb_id
-                    << (thumb_id.size() == 24
-                            ? " not in DB"
-                            : " not reachable via Protect API");
+                    << ": no snapshot or thumbnail available";
           ++hb_skipped_no_thumb;
-          // Update hwm even on skip so we don't retry endlessly.
           impl_->hwm[cam_id] = start_ms;
           continue;
         }
 
         LOG(INFO) << "[motion_poller] event " << ev_id
-                  << ": fetched thumbnail " << thumb_id
-                  << " (" << jpeg.size() << " bytes), running NanoDet-M";
+                  << ": running NanoDet-M on "
+                  << (jpeg_wide.empty()
+                          ? ""
+                          : "snapshot(" + std::to_string(jpeg_wide.size()) + "B) ")
+                  << (jpeg_crop.empty()
+                          ? ""
+                          : "thumb(" + std::to_string(jpeg_crop.size()) + "B)");
 
-        // Run NanoDet-M on the thumbnail.
-        auto det = impl_->detector->detect(jpeg);
-        if (!det.has_value()) {
-          LOG(INFO) << "[motion_poller] skip event " << ev_id
-                    << ": NanoDet-M returned no detection"
-                    << " (no object above confidence threshold)";
-          impl_->hwm[cam_id] = start_ms;
-          continue;
+        // Try the tight-crop image first -- empirically higher hit rate
+        // because the subject occupies more of the frame.  Fall back to
+        // the wide snapshot if the crop comes up empty.
+        std::optional<object_detect::Detection> det;
+        std::vector<uint8_t> jpeg;  // the image that actually produced det
+        for (const auto* candidate : {&jpeg_crop, &jpeg_wide}) {
+          if (candidate->empty()) continue;
+          auto d = impl_->detector->detect(*candidate);
+          if (d.has_value() &&
+              object_detect::is_security_relevant(d->class_id)) {
+            det = d;
+            jpeg = *candidate;
+            break;
+          }
         }
-        if (!object_detect::is_security_relevant(det->class_id)) {
+
+        // When NanoDet doesn't return a security-relevant class but the
+        // camera is opted in via --first_party_cameras, the user wants the
+        // motion event to surface through Protect's smart-detect filter
+        // anyway.  Fall back to the configured class (default "person")
+        // and use whichever image we have -- preferring the crop (which
+        // is closer to motion centroid) so the thumbnail still looks
+        // reasonable in the UI.
+        bool fell_back = false;
+        if (!det.has_value() && impl_->always_smart_detect) {
+          jpeg = !jpeg_crop.empty() ? jpeg_crop : jpeg_wide;
+          if (!jpeg.empty()) {
+            fell_back = true;
+            LOG(INFO) << "[motion_poller] event " << ev_id
+                      << ": no NanoDet-M hit; falling back to class '"
+                      << impl_->fallback_object_type << "' (confidence=0)";
+          }
+        }
+
+        if (!det.has_value() && !fell_back) {
           LOG(INFO) << "[motion_poller] skip event " << ev_id
-                    << ": NanoDet-M detected class_id=" << det->class_id
-                    << " which is not security-relevant"
-                    << " (person/vehicle/animal/package)";
+                    << ": NanoDet-M found nothing security-relevant"
+                    << " in either snapshot or thumbnail"
+                    << " (and always_smart_detect is off)";
           impl_->hwm[cam_id] = start_ms;
           continue;
         }
@@ -680,12 +735,18 @@ void MotionPoller::poll_loop() {
         // events.score / smartDetectObjects.attributes.confidence
         // schema uses an integer in [0, 100], so scale + clamp here
         // and reuse for both the SQL parameter and the in-row JSON
-        // blobs we build below.
-        const int confidence = std::max(0, std::min(100,
-            static_cast<int>(std::lround(det->confidence * 100.0f))));
+        // blobs we build below.  Fallback path (no NanoDet hit but
+        // always_smart_detect on) writes confidence=0 to make it
+        // obvious in the data which events came from the AI vs the
+        // motion-only fallback.
+        const int confidence = det.has_value()
+            ? std::max(0, std::min(100,
+                static_cast<int>(std::lround(det->confidence * 100.0f))))
+            : 0;
         const std::string conf_str = std::to_string(confidence);
-        const std::string obj_type =
-            object_detect::detection_type(det->class_id);
+        const std::string obj_type = det.has_value()
+            ? object_detect::detection_type(det->class_id)
+            : impl_->fallback_object_type;
         const std::string sdt_json =
             motion_poller_internal::smart_detect_types_json(obj_type);
         const std::string new_event_id = util::generate_uuid();
@@ -703,8 +764,12 @@ void MotionPoller::poll_loop() {
         const std::string end_str      = std::to_string(end_ms);
         const std::string ts_str       = std::to_string(start_ms);
 
-        // Crop the thumbnail using the detection bbox.
-        std::vector<uint8_t> cropped = jpeg_crop::crop(jpeg, det->bbox);
+        // Crop the thumbnail using the detection bbox.  In the fallback
+        // path (no NanoDet hit) we use the whole image -- there's no
+        // bbox to crop with and the UI gets a wider context shot.
+        std::vector<uint8_t> cropped = det.has_value()
+            ? jpeg_crop::crop(jpeg, det->bbox)
+            : std::vector<uint8_t>{};
         if (cropped.empty()) cropped = std::move(jpeg);
 
         // Forward the cropped JPEG to MSR's StoreSnapshots when an MsrClient
@@ -734,28 +799,80 @@ void MotionPoller::poll_loop() {
                   : util::generate_24hex_id();
         }
 
+        // Version gate: on Protect 7.1+, write the rich events.metadata +
+        // thumbnailFullfovId.  On older versions, keep the legacy sparse SQL
+        // exactly as before so existing installs see no behavioural change.
+        const bool rich_path = onvif::protect_version::IsAtLeast(7, 1, 0);
+        std::string rich_metadata;
+        if (rich_path) {
+          onvif::enricher::EventInput ein;
+          ein.event_id          = new_event_id;
+          ein.camera_id         = cam_id;
+          ein.event_type        = "smartDetectZone";
+          ein.smart_detect_types = {obj_type};
+          ein.score             = confidence;
+          ein.thumbnail_id      = new_thumb_id;
+          ein.start_ms          = start_ms;
+          ein.end_ms            = end_ms;
+          // TODO: thread the real image dimensions through from the camera
+          // record so the placeholder bbox matches the camera's frame size.
+          // First-party cameras: G3 Dome=1920x1080, G4 Doorbell=1600x1200, etc.
+          ein.image_width       = 2560;
+          ein.image_height      = 1440;
+          ein.object_ids        = {sdo_id};
+          rich_metadata = onvif::enricher::BuildEnrichedMetadata(ein);
+        }
+
         // INSERT event.
         {
-          const char* ep[] = {
-            new_event_id.c_str(), start_str.c_str(), cam_id.c_str(),
-            sdt_json.c_str(), new_thumb_id.c_str(),
-            now_str.c_str(), now_str.c_str(), end_str.c_str(),
-            conf_str.c_str()
-          };
           impl_->maybe_reconnect();
-          PGresult* r = PQexecParams(impl_->conn,
-            "INSERT INTO events"
-            " (id, type, start, \"cameraId\", score, \"smartDetectTypes\","
-            "  metadata, locked, \"thumbnailId\", \"createdAt\","
-            "  \"updatedAt\", \"end\")"
-            " VALUES ($1, 'smartDetectZone', $2::bigint, $3, $9::int, "
-            "  $4::json, '{\"source\":\"onvif-recorder\"}'::json, false, $5,"
-            "  $6, $7, $8::bigint)",
-            9, nullptr, ep, nullptr, nullptr, 0);
-          if (PQresultStatus(r) != PGRES_COMMAND_OK)
-            LOG(ERROR) << "[motion_poller] insert event: "
-                       << PQerrorMessage(impl_->conn);
-          PQclear(r);
+          if (!rich_path) {
+            // Legacy sparse SQL -- unchanged from before the 7.1 migration.
+            const char* ep[] = {
+              new_event_id.c_str(), start_str.c_str(), cam_id.c_str(),
+              sdt_json.c_str(), new_thumb_id.c_str(),
+              now_str.c_str(), now_str.c_str(), end_str.c_str(),
+              conf_str.c_str()
+            };
+            PGresult* r = PQexecParams(impl_->conn,
+              "INSERT INTO events"
+              " (id, type, start, \"cameraId\", score, \"smartDetectTypes\","
+              "  metadata, locked, \"thumbnailId\", \"createdAt\","
+              "  \"updatedAt\", \"end\")"
+              " VALUES ($1, 'smartDetectZone', $2::bigint, $3, $9::int, "
+              "  $4::json, '{\"source\":\"onvif-recorder\"}'::json, false, $5,"
+              "  $6, $7, $8::bigint)",
+              9, nullptr, ep, nullptr, nullptr, 0);
+            if (PQresultStatus(r) != PGRES_COMMAND_OK)
+              LOG(ERROR) << "[motion_poller] insert event: "
+                         << PQerrorMessage(impl_->conn);
+            PQclear(r);
+          } else {
+            // Rich path (Protect 7.1+): metadata is the enriched JSON;
+            // thumbnailFullfovId reuses thumbnailId until we have a separate
+            // full-FOV crop.  See TODO note where rich_metadata is built.
+            const char* ep[] = {
+              new_event_id.c_str(), start_str.c_str(), cam_id.c_str(),
+              sdt_json.c_str(), new_thumb_id.c_str(),
+              now_str.c_str(), now_str.c_str(), end_str.c_str(),
+              conf_str.c_str(),
+              rich_metadata.c_str(),
+              new_thumb_id.c_str(),  // TODO: separate full-FOV thumb id
+            };
+            PGresult* r = PQexecParams(impl_->conn,
+              "INSERT INTO events"
+              " (id, type, start, \"cameraId\", score, \"smartDetectTypes\","
+              "  metadata, locked, \"thumbnailId\", \"createdAt\","
+              "  \"updatedAt\", \"end\", \"thumbnailFullfovId\")"
+              " VALUES ($1, 'smartDetectZone', $2::bigint, $3, $9::int, "
+              "  $4::json, $10::json, false, $5,"
+              "  $6, $7, $8::bigint, $11)",
+              11, nullptr, ep, nullptr, nullptr, 0);
+            if (PQresultStatus(r) != PGRES_COMMAND_OK)
+              LOG(ERROR) << "[motion_poller] insert event (rich): "
+                         << PQerrorMessage(impl_->conn);
+            PQclear(r);
+          }
         }
 
         // INSERT smartDetectObjects.
@@ -779,6 +896,42 @@ void MotionPoller::poll_loop() {
           if (PQresultStatus(r) != PGRES_COMMAND_OK)
             LOG(ERROR) << "[motion_poller] insert sdo: "
                        << PQerrorMessage(impl_->conn);
+          PQclear(r);
+        }
+
+        // INSERT smartDetectObjectAreas on Protect 7.1+ -- the bbox + grid
+        // cells the UI uses for the overlay.  Uses placeholder bbox (centred
+        // quad) until we wire in real per-frame bounding boxes from the
+        // camera analytics stream.
+        if (rich_path) {
+          const auto bb = onvif::enricher::PlaceholderBbox(
+              2560, 1440, obj_type);
+          const std::string area_id = "sda-" + sdo_id;
+          const std::string area_idx_sql =
+              onvif::enricher::FullGridAreaIndexesSqlArray();
+          const std::string x1 = std::to_string(bb.x1);
+          const std::string y1 = std::to_string(bb.y1);
+          const std::string x2 = std::to_string(bb.x2);
+          const std::string y2 = std::to_string(bb.y2);
+          const char* ap[] = {
+            area_id.c_str(), sdo_id.c_str(),
+            x1.c_str(), y1.c_str(), x2.c_str(), y2.c_str(),
+            ts_str.c_str(), end_str.c_str(),
+          };
+          const std::string sql =
+              "INSERT INTO \"smartDetectObjectAreas\""
+              " (id, \"smartDetectObjectId\", \"areaIndexes\","
+              "  \"boundingX1\", \"boundingY1\", \"boundingX2\", \"boundingY2\","
+              "  \"detectedAt\", \"lastSeenAt\")"
+              " VALUES ($1, $2, " + area_idx_sql + ","
+              " $3::bigint, $4::bigint, $5::bigint, $6::bigint,"
+              " $7::bigint, $8::bigint)"
+              " ON CONFLICT (id) DO NOTHING";
+          PGresult* r = PQexecParams(impl_->conn, sql.c_str(),
+                                     8, nullptr, ap, nullptr, nullptr, 0);
+          if (PQresultStatus(r) != PGRES_COMMAND_OK)
+            LOG(WARNING) << "[motion_poller] insert sda: "
+                         << PQerrorMessage(impl_->conn);
           PQclear(r);
         }
 
@@ -955,10 +1108,22 @@ void MotionPoller::poll_loop() {
           }
         }
 
-        // Fire alarm notification.
-        if (impl_->alarm_notifier && !cam_mac.empty()) {
+        // Fire alarm notification -- only for live events, never for the
+        // 7-day backfill pass.  Threshold is wall-clock age of the source
+        // motion event: under 60s = "live", anything older we treat as
+        // historical and skip the automation trigger.  Otherwise a startup
+        // backfill would replay every alarm sound + automation from the
+        // last week.
+        const uint64_t event_age_ms =
+            (util::now_ms() > start_ms) ? (util::now_ms() - start_ms) : 0;
+        const bool live_event = event_age_ms < 60'000ULL;
+        if (live_event && impl_->alarm_notifier && !cam_mac.empty()) {
           impl_->alarm_notifier->notify(obj_type, cam_mac,
                                         new_event_id, start_ms);
+        } else if (!live_event) {
+          LOG(INFO) << "[motion_poller] backfill: skipping alarm trigger for "
+                    << new_event_id << " (event is "
+                    << (event_age_ms / 1000) << "s old)";
         }
 
         LOG(INFO) << "[motion_poller] " << obj_type << " detected in "

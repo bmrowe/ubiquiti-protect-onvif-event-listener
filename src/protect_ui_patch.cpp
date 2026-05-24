@@ -28,6 +28,7 @@
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "protect_version.hpp"
 
 namespace protect_ui {
 
@@ -259,10 +260,18 @@ absl::Status patch_alarm_picker() {
       }
       pclose(p);  // NOLINT
     }
-    if (!ver.empty())
+    if (!ver.empty()) {
       LOG(INFO) << "[ui_patch] detected unifi-protect " << ver;
-    else
+      // Publish the version so live writers (detection_recorder,
+      // motion_poller) can gate on it via IsAtLeast(7, 1, 0).
+      if (auto v = onvif::protect_version::Parse(ver)) {
+        onvif::protect_version::SetCurrent(*v);
+        LOG(INFO) << "[ui_patch] protect_version published: "
+                  << v->major << "." << v->minor << "." << v->patch;
+      }
+    } else {
       LOG(INFO) << "[ui_patch] unifi-protect version unknown";
+    }
   }
 
   auto md5sums = load_dpkg_md5sums();

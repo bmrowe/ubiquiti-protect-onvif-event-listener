@@ -22,6 +22,7 @@
  *   - polls motion events from first-party cameras and runs NanoDet-M detection
  */
 
+#include <libpq-fe.h>
 #include <sys/stat.h>
 #include <sys/sysinfo.h>
 #include <sys/utsname.h>
@@ -67,7 +68,9 @@
 #define ONVIF_RECORDER_VERSION "dev"
 #endif
 #include "cameras_change_listener.hpp"
+#include "event_recovery.hpp"
 #include "motion_poller.hpp"
+#include "protect_version.hpp"
 #include "object_detect.hpp"
 #include "onvif_listener.hpp"
 #include "patch_watcher.hpp"
@@ -219,6 +222,55 @@ ABSL_FLAG(bool, coalesce_history, true,
     "that are within --coalesce_window_sec of each other.");
 ABSL_FLAG(int32_t, coalesce_history_days, 30,
     "Number of days to look back when --coalesce_history is set.");
+
+ABSL_FLAG(bool, first_party_always_smart_detect, true,
+    "When true, motion_poller writes a smartDetectZone event for EVERY motion "
+    "event from opted-in first-party cameras (--first_party_cameras), even when "
+    "NanoDet-M doesn't find a security-relevant subject.  The fallback event uses "
+    "--first_party_fallback_class as its smartDetectType and confidence=0 so the "
+    "data clearly shows it wasn't AI-classified.  Disable to keep the older "
+    "behaviour where unclassified motion events stay invisible to Protect's "
+    "smart-detect filter.");
+ABSL_FLAG(std::string, first_party_fallback_class, "person",
+    "smartDetectType written when --first_party_always_smart_detect=true and "
+    "NanoDet-M didn't classify the motion event.  Use 'person' / 'vehicle' / "
+    "'animal' / 'package' or any string Protect's UI recognises.  Default "
+    "'person' (the most common case for a typical home camera).");
+
+ABSL_FLAG(int32_t, motion_backfill_days, 7,
+    "On startup, motion_poller pulls its per-camera high-water mark back "
+    "to (now - N days) so the live poll loop re-scans recent motion events "
+    "and re-classifies any that didn't produce a smartDetectZone last time "
+    "(typical reason: an older code path that lost NanoDet hits because "
+    "Protect's /snapshot endpoint returned 640x360 instead of full FOV).  "
+    "Events with an existing overlapping smartDetectZone are still excluded "
+    "so no duplicates are written.  Alarm notifications are suppressed for "
+    "events older than 60 seconds.  Set to 0 to disable.");
+
+ABSL_FLAG(bool, auto_recover_events, true,
+    "On startup, if onvif-recorder detects the events table has been wiped "
+    "while video recordings still exist (oldest event is more than --auto_"
+    "recover_threshold_hours newer than the oldest recordingFile), restore "
+    "events + detectionLabels + labels from Protect's most recent on-device "
+    "DB backup at /srv/unifi-protect/dbBackups/ and re-run the 7.1+ enricher "
+    "over them.  Gated by Protect >= 7.1.0 (see protect_version.hpp).  Set "
+    "to false to disable.");
+ABSL_FLAG(int32_t, auto_recover_threshold_hours, 24,
+    "Threshold for --auto_recover_events.  If oldest_event - oldest_recording "
+    "exceeds this many hours, recovery fires.  Setting too low risks "
+    "spurious restores during normal cluster maintenance; default 24h is "
+    "well above any expected legitimate gap.");
+
+ABSL_FLAG(bool, autoupdate_enabled, true,
+    "Whether the device should auto-recover the onvif-recorder package after "
+    "a firmware wipe.  Read by /data/onvif-recorder/install.sh post-install "
+    "and written to /data/onvif-recorder/.autoupdate-consent.  Default true: "
+    "running install.sh is itself an act of consent.  Set to false to opt out, "
+    "in which case a firmware wipe will require manually re-running the apt "
+    "installer.  See the wipe-recovery branch in /data/onvif-recorder/"
+    "boot-restore.sh -- a missing /usr/bin/onvif-recorder ignores this flag "
+    "and reinstalls anyway, because losing the binary you didn't ask to lose "
+    "is recovery, not auto-update.");
 
 // --- New flags for first-party support, change log, and rollback ---
 
@@ -886,6 +938,11 @@ int main(int argc, char* argv[]) {
         motion_poller->set_use_msr_thumbnail_ids(use_msr_thumb_ids);
         motion_poller->set_protect_api(
             absl::GetFlag(FLAGS_protect_url), &protect_user_id_provider);
+        motion_poller->set_backfill_lookback_days(
+            absl::GetFlag(FLAGS_motion_backfill_days));
+        motion_poller->set_always_smart_detect(
+            absl::GetFlag(FLAGS_first_party_always_smart_detect),
+            absl::GetFlag(FLAGS_first_party_fallback_class));
       } else {
         LOG(ERROR) << "[motion_poller] " << mp_or.status().message();
       }
@@ -967,6 +1024,52 @@ int main(int argc, char* argv[]) {
     const int n = det_rec.purge_stale_open_events(300000);
     if (n > 0)
       LOG(INFO) << "[startup] purged " << n << " stuck-open event(s)";
+  }
+
+  // Auto-recover events from on-device backup if the events table looks wiped
+  // (oldest event much newer than the oldest recordingFile we're keeping),
+  // then run the enricher unconditionally to backfill any restored events
+  // that still need the rich-format detail rows (smartDetectObjects /
+  // smartDetectObjectAreas).  Both phases are gated by Protect >= 7.1.0
+  // inside the library and by --auto_recover_events here.  EnrichRestored
+  // is idempotent -- the SELECT it issues filters down to events that
+  // actually need work (sparse metadata OR orphaned detectionLabels.objectId
+  // without a matching SDO), so on a healthy fully-enriched DB it's a
+  // single empty-result query and exits immediately.
+  if (absl::GetFlag(FLAGS_auto_recover_events)) {
+    const uint64_t thresh_ms =
+        static_cast<uint64_t>(absl::GetFlag(FLAGS_auto_recover_threshold_hours))
+        * 3'600'000ULL;
+    PGconn* rec_conn = PQconnectdb(db_conn.c_str());
+    if (PQstatus(rec_conn) == CONNECTION_OK) {
+      // Phase 1: restore from backup if needed.
+      if (onvif::event_recovery::ShouldRecover(rec_conn, thresh_ms)) {
+        auto backup = onvif::event_recovery::FindLatestBackup(
+            "/srv/unifi-protect/dbBackups");
+        if (backup) {
+          LOG(INFO) << "[auto_recover] restoring from " << backup->path;
+          auto s = onvif::event_recovery::RestoreFromBackup(rec_conn, backup->path);
+          if (!s.ok())
+            LOG(ERROR) << "[auto_recover] restore failed: " << s.message();
+        } else {
+          LOG(INFO) << "[auto_recover] no backup file under /srv/unifi-protect/dbBackups";
+        }
+      }
+      // Phase 2: enrich any events still missing rich-format detail rows.
+      // Runs unconditionally (still version-gated inside) -- catches both
+      // the events Phase 1 just restored AND events from earlier restores
+      // whose SDO/SDA rows weren't preserved.
+      if (onvif::protect_version::IsAtLeast(7, 1, 0)) {
+        auto s = onvif::event_recovery::EnrichRestored(rec_conn);
+        if (!s.ok())
+          LOG(ERROR) << "[auto_recover] enrich failed: " << s.message();
+      }
+      PQfinish(rec_conn);
+    } else {
+      LOG(WARNING) << "[auto_recover] DB connect failed: "
+                   << PQerrorMessage(rec_conn);
+      PQfinish(rec_conn);
+    }
   }
 
   if (absl::GetFlag(FLAGS_coalesce_history)) {

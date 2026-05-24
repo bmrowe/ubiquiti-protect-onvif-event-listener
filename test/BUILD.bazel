@@ -9,6 +9,31 @@ filegroup(
     visibility = ["//visibility:public"],
 )
 
+cc_test(
+    name = "test_event_enricher",
+    srcs = ["test_event_enricher.cpp"],
+    deps = [
+        "//:event_enricher",
+    ],
+)
+
+cc_test(
+    name = "test_protect_version",
+    srcs = ["test_protect_version.cpp"],
+    deps = [
+        "//:protect_version",
+    ],
+)
+
+cc_test(
+    name = "test_event_recovery",
+    srcs = ["test_event_recovery.cpp"],
+    deps = [
+        "//:event_recovery",
+        "//:protect_version",
+    ],
+)
+
 cc_library(
     name = "onvif_camera_emulator",
     srcs = ["onvif_camera_emulator.cpp"],
@@ -178,6 +203,7 @@ cc_test(
         "//:alarm_notifier",
         "//:detection_recorder",
         "//:msr_client",
+        "//:protect_version",
         "//:ubv_thumbnail",
         ":camera_emulators",
         ":onvif_camera_emulator",
@@ -207,6 +233,7 @@ cc_library(
     ],
     hdrs = ["//:src/protect_ui_patch.hpp"],
     deps = [
+        "//:protect_version",
         "@com_google_absl//absl/log:log",
         "@com_google_absl//absl/status:status",
         "@com_google_absl//absl/status:statusor",

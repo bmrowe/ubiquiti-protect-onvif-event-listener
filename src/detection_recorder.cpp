@@ -38,6 +38,8 @@
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
 #include "contention_profiler.hpp"
+#include "event_enricher.hpp"
+#include "protect_version.hpp"
 #include "util.hpp"
 #include "alarm_notifier.hpp"
 #include "jpeg_crop.hpp"
@@ -407,22 +409,89 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
                     const std::string& camera_ip,
                     const std::string& sdt_json,
                     const std::string& thumb_id,
-                    const std::string& now_str) override {
+                    const std::string& now_str,
+                    const std::string& metadata = "",
+                    const std::string& thumb_fullfov_id = "") override {
     const std::string& cam_id = camera_id(camera_ip);
     const std::string  ts     = std::to_string(ts_ms);
+
+    // Legacy sparse path: hardcoded "source" marker only.  Triggered when
+    // protect_version < 7.1.0 (the caller passes metadata="").  The
+    // marker is what coalesce_history + the orphan-purge routines key on
+    // to identify our writes among Protect's own.
+    if (metadata.empty()) {
+      const char* params[] = {
+        id.c_str(), ts.c_str(), cam_id.c_str(),
+        sdt_json.c_str(), thumb_id.c_str(), now_str.c_str(), now_str.c_str()
+      };
+      exec_params(
+        "INSERT INTO events"
+        " (id, type, start, \"cameraId\", score, \"smartDetectTypes\","
+        "  metadata, locked, \"thumbnailId\", \"createdAt\", \"updatedAt\")"
+        " VALUES ($1, 'smartDetectZone', $2::bigint, $3, 100, $4::json,"
+        "         '{\"source\":\"onvif-recorder\"}'::json, false, $5, $6, $7)",
+        7, params);
+      return;
+    }
+
+    // Rich path (Protect 7.1+): caller supplies the full metadata JSON.
+    // The "source" marker is still embedded inside the metadata so our
+    // orphan-purge / coalesce-history queries continue to identify our
+    // writes -- event_enricher::BuildEnrichedMetadata is responsible for
+    // including it.  thumbnailFullfovId may be empty (NULL column) when
+    // we lack a full-FOV crop; otherwise it points at an MSR-format id.
+    const std::string fullfov_or_null = thumb_fullfov_id;  // may be empty -> NULL
     const char* params[] = {
       id.c_str(), ts.c_str(), cam_id.c_str(),
-      sdt_json.c_str(), thumb_id.c_str(), now_str.c_str(), now_str.c_str()
+      sdt_json.c_str(), thumb_id.c_str(), now_str.c_str(), now_str.c_str(),
+      metadata.c_str(),
+      fullfov_or_null.empty() ? nullptr : fullfov_or_null.c_str(),
     };
-    // locked = false (boolean literal); metadata/score are literals.
-    // $4::json casts the JSON text to the json column type.
     exec_params(
       "INSERT INTO events"
       " (id, type, start, \"cameraId\", score, \"smartDetectTypes\","
-      "  metadata, locked, \"thumbnailId\", \"createdAt\", \"updatedAt\")"
+      "  metadata, locked, \"thumbnailId\", \"createdAt\", \"updatedAt\","
+      "  \"thumbnailFullfovId\")"
       " VALUES ($1, 'smartDetectZone', $2::bigint, $3, 100, $4::json,"
-      "         '{\"source\":\"onvif-recorder\"}'::json, false, $5, $6, $7)",
-      7, params);
+      "         $8::json, false, $5, $6, $7, $9)",
+      9, params);
+  }
+
+  void insert_smart_detect_object_area(
+      const std::string& id,
+      const std::string& sdo_id,
+      int bbox_x1, int bbox_y1, int bbox_x2, int bbox_y2,
+      uint64_t detected_at_ms,
+      uint64_t last_seen_ms,
+      const std::string& now_str) override {
+    // TODO: derive areaIndexes from bbox intersection with the 12x10 grid,
+    // not the full grid as we do here.  Until then we use full coverage so
+    // the UI's "show areas" overlay renders (and the on-disk shape matches
+    // event_enricher's synthesised output).
+    const std::string area_idx = onvif::enricher::FullGridAreaIndexesSqlArray();
+    const std::string x1 = std::to_string(bbox_x1);
+    const std::string y1 = std::to_string(bbox_y1);
+    const std::string x2 = std::to_string(bbox_x2);
+    const std::string y2 = std::to_string(bbox_y2);
+    const std::string da = std::to_string(detected_at_ms);
+    const std::string la = std::to_string(last_seen_ms);
+    (void)now_str;  // smartDetectObjectAreas has no createdAt/updatedAt cols.
+    const char* params[] = {
+      id.c_str(), sdo_id.c_str(),
+      x1.c_str(), y1.c_str(), x2.c_str(), y2.c_str(),
+      da.c_str(), la.c_str(),
+    };
+    // Embed the areaIndexes literal directly (it's a constant ARRAY[...]::int[]).
+    const std::string sql =
+        "INSERT INTO \"smartDetectObjectAreas\""
+        " (id, \"smartDetectObjectId\", \"areaIndexes\","
+        "  \"boundingX1\", \"boundingY1\", \"boundingX2\", \"boundingY2\","
+        "  \"detectedAt\", \"lastSeenAt\")"
+        " VALUES ($1, $2, " + area_idx + ", "
+        " $3::bigint, $4::bigint, $5::bigint, $6::bigint,"
+        " $7::bigint, $8::bigint)"
+        " ON CONFLICT (id) DO NOTHING";
+    exec_params(sql.c_str(), 8, params);
   }
 
   void insert_sdo(const std::string& id,
@@ -1422,13 +1491,53 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
         + "\"zone\":[]"
         + "}";
 
+    // Version gate: on Protect 7.1+, write the rich events.metadata + the
+    // thumbnailFullfovId + a smartDetectObjectAreas row.  On earlier
+    // versions, keep the legacy sparse path EXACTLY as before so existing
+    // installs see no behavioural change.
+    const bool rich_path = onvif::protect_version::IsAtLeast(7, 1, 0);
+
+    // Build the rich events.metadata + bbox lazily; cheap when not used.
+    std::string rich_metadata;
+    onvif::enricher::Bbox rich_bbox{0, 0, 0, 0};
+    std::string rich_area_id;
+    if (rich_path) {
+      onvif::enricher::EventInput ein;
+      ein.event_id          = event_id;
+      ein.camera_id         = cam_uuid;  // populated from camera_ids_ earlier
+      ein.event_type        = "smartDetectZone";
+      ein.smart_detect_types = {obj_type};
+      ein.score             = 100;            // matches sparse-path literal
+      ein.thumbnail_id      = thumb_id;
+      ein.start_ms          = ts_ms;
+      ein.end_ms            = ts_ms;
+      // TODO: thread the camera's actual image dimensions through to here.
+      // Defaulting matches event_enricher's default; the bbox is placeholder
+      // anyway.  When we wire ONVIF tt:BoundingBox into the live path we
+      // can compute the real bbox + grid intersection here too.
+      ein.image_width       = 2560;
+      ein.image_height      = 1440;
+      ein.object_ids        = {sdo_id};
+      rich_metadata = onvif::enricher::BuildEnrichedMetadata(ein);
+      rich_bbox = onvif::enricher::PlaceholderBbox(
+          ein.image_width, ein.image_height, obj_type);
+      rich_area_id = "sda-" + sdo_id;
+    }
+
     // 4. INSERT into both tables, write thumbnail -- all under lock.
     {
       absl::MutexLock lk(&mu_);
 
       if (coalesced_event_id.empty()) {
         // New event: insert event row, open it, and record rate-limit timestamp.
-        db_->insert_event(event_id, ts_ms, ev.camera_ip, sdt_json, thumb_id, now_str);
+        // Rich path passes the enriched metadata + thumbnailFullfovId so the
+        // 7.1 UI renders the bbox overlay / weather pill / etc.  Empty
+        // strings (legacy path) trigger the backend's hardcoded sparse SQL.
+        // TODO: thumbnailFullfovId should be a separate full-FOV snapshot;
+        // for now we reuse thumb_id so the column is non-null on 7.1+.
+        db_->insert_event(event_id, ts_ms, ev.camera_ip, sdt_json, thumb_id, now_str,
+                          rich_metadata,
+                          rich_path ? thumb_id : std::string());
         open_[key] = event_id;
         if (max_events_per_hour_ > 0)
           recent_event_times_[ev.camera_ip].push_back(util::now_ms());
@@ -1443,6 +1552,12 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
       db_->insert_smart_detect_track(sdtrk_id, event_id, ev.camera_ip,
                                       ts_ms, ts_ms, obj_type,
                                       /*confidence=*/0, now_str);
+      if (rich_path) {
+        db_->insert_smart_detect_object_area(
+            rich_area_id, sdo_id,
+            rich_bbox.x1, rich_bbox.y1, rich_bbox.x2, rich_bbox.y2,
+            ts_ms, ts_ms, now_str);
+      }
 
       // Insert detectionLabels rows so events appear in Protect's find-anything
       // endpoint (which does INNER JOIN on detectionLabels WHERE objectId IS NULL).

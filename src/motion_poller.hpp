@@ -102,6 +102,26 @@ class MotionPoller {
   /// Interval in seconds between poll cycles.  Default: 10.
   void set_poll_interval(int sec);
 
+  /// On startup, pull the high-water mark back to (now - @p days) so the
+  /// next poll cycles re-scan the last N days of motion events and
+  /// re-classify any that didn't produce a smartDetectZone last time
+  /// (because of an old code path or NanoDet failure).  Events with an
+  /// existing overlapping smartDetectZone are excluded by the same
+  /// NOT-EXISTS filter the live path uses, so this never duplicates.
+  /// Default 0 disables the feature.
+  void set_backfill_lookback_days(int days);
+
+  /// When @p on is true and NanoDet-M doesn't find a security-relevant
+  /// subject in either the wide snapshot or the cropped thumbnail, motion_poller
+  /// still writes a smartDetectZone event tagged with @p fallback_object_type
+  /// (defaulting to "person" when empty) and confidence=0.  This is what the
+  /// "always smart-detect for opt'd-in first-party cameras" mode boils down to
+  /// at the row level: the camera saw motion, the human user wants to see it
+  /// surfaced through Protect's smart-detect filter, and we don't make them
+  /// configure every detail.
+  /// Default: on=true, fallback="person".
+  void set_always_smart_detect(bool on, const std::string& fallback_object_type);
+
   /// Coalescing window (seconds).  If a smart detection event already exists
   /// near a motion event, the motion event is skipped.  Default: 30.
   void set_coalesce_window(uint32_t sec);

@@ -304,12 +304,31 @@ class DetectionRecorder {
     /// True when the backend needs a snapshot fetched on detection.
     virtual bool needs_snapshot() const = 0;
 
+    /// Insert one row into events.  The trailing two params let callers
+    /// supply a richer-than-default events.metadata JSON (used on Protect 7.1+
+    /// where the UI consumes detectedAreas / detectedThumbnails / zonesStatus /
+    /// weather) and a thumbnailFullfovId.  Both default to empty for the
+    /// legacy path: empty metadata -> hardcoded {"source":"onvif-recorder"};
+    /// empty thumb_fullfov_id -> NULL column.
     virtual void insert_event(const std::string& id,
                               uint64_t           ts_ms,
                               const std::string& camera_ip,
                               const std::string& sdt_json,
                               const std::string& thumb_id,
-                              const std::string& now_str) = 0;
+                              const std::string& now_str,
+                              const std::string& metadata = "",
+                              const std::string& thumb_fullfov_id = "") = 0;
+
+    /// Insert one row into smartDetectObjectAreas.  Only called on Protect
+    /// 7.1+ where the UI uses this table for the bbox overlay.  Default impl
+    /// is a no-op for mocks / older-Protect backends.
+    virtual void insert_smart_detect_object_area(
+        const std::string& /*id*/,
+        const std::string& /*sdo_id*/,
+        int /*bbox_x1*/, int /*bbox_y1*/, int /*bbox_x2*/, int /*bbox_y2*/,
+        uint64_t /*detected_at_ms*/,
+        uint64_t /*last_seen_ms*/,
+        const std::string& /*now_str*/) {}
 
     virtual void insert_sdo(const std::string& id,
                             const std::string& event_id,

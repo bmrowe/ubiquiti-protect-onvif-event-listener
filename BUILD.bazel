@@ -74,6 +74,37 @@ cc_library(
 )
 
 cc_library(
+    name = "event_enricher",
+    srcs = ["src/event_enricher.cpp"],
+    hdrs = ["src/event_enricher.hpp"],
+    strip_include_prefix = "src",
+    deps = [":util"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "event_recovery",
+    srcs = ["src/event_recovery.cpp"],
+    hdrs = ["src/event_recovery.hpp"],
+    strip_include_prefix = "src",
+    deps = [
+        ":event_enricher",
+        ":protect_version",
+        "@com_google_absl//absl/log:log",
+        "@com_google_absl//absl/status:status",
+    ] + _PQ,
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "protect_version",
+    srcs = ["src/protect_version.cpp"],
+    hdrs = ["src/protect_version.hpp"],
+    strip_include_prefix = "src",
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "contention_profiler",
     srcs = ["src/contention_profiler.cpp"],
     hdrs = ["src/contention_profiler.hpp"],
@@ -284,10 +315,12 @@ cc_library(
     deps = [
         ":alarm_notifier",
         ":contention_profiler",
+        ":event_enricher",
         ":jpeg_crop",
         ":msr_client",
         ":object_detect",
         ":onvif_listener",
+        ":protect_version",
         ":ubv_thumbnail",
         ":util",
         "@com_google_absl//absl/log:log",
@@ -334,6 +367,7 @@ cc_library(
     hdrs = ["src/protect_ui_patch.hpp"],
     strip_include_prefix = "src",
     deps = [
+        ":protect_version",
         "@com_google_absl//absl/log:log",
         "@com_google_absl//absl/status:status",
         "@com_google_absl//absl/status:statusor",
@@ -407,10 +441,12 @@ cc_library(
     strip_include_prefix = "src",
     deps = _CURL + [
         ":alarm_notifier",
+        ":event_enricher",
         ":jpeg_crop",
         ":msr_client",
         ":object_detect",
         ":protect_user_id_provider",
+        ":protect_version",
         ":ubv_thumbnail",
         ":util",
         "@com_google_absl//absl/log:log",
@@ -423,7 +459,7 @@ cc_binary(
     name = "onvif_recorder",
     srcs = ["src/main.cpp"],
     linkstatic = True,
-    deps = [":tcmalloc_force_link"] + [
+    deps = [":tcmalloc_force_link"] + _PQ + [
         ":admin_server",
         ":alarm_notifier",
         ":camera_change_log",
@@ -432,6 +468,7 @@ cc_binary(
         ":cpu_profiler",
         ":detection_recorder",
         ":event_recorder",
+        ":event_recovery",
         ":log_ring",
         ":log_server",
         ":motion_poller",
@@ -510,4 +547,23 @@ cc_binary(
         "@com_google_absl//absl/flags:parse",
         "@com_google_absl//absl/status:statusor",
     ] + _PQ,
+)
+
+cc_binary(
+    name = "enrich_events",
+    srcs = ["src/enrich_events_main.cpp"],
+    linkstatic = True,
+    deps = [
+        ":event_enricher",
+        ":util",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/flags:parse",
+        "@com_google_absl//absl/log:initialize",
+        "@com_google_absl//absl/log:log",
+        "@com_google_absl//absl/strings:strings",
+        # _PQ on the arm64 sysroot only re-exports its own -l flags; libpq.a
+        # references LDAP/SASL/GnuTLS symbols that only get pulled in when
+        # libcurl is also linked.  Include _CURL so we inherit that full
+        # transitive set without having to enumerate it here.
+    ] + _PQ + _CURL,
 )

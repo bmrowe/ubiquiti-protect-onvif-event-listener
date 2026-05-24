@@ -161,10 +161,21 @@ if [ -f "$BACKUP" ]; then
     tar -xzf "$BACKUP" -C /
 fi
 
-# Auto-reinstall is gated on a consent file written by install.sh.  The
-# file is regenerated from /etc/onvif-recorder/config.json on every
-# install/upgrade so flipping autoupdate_enabled in the admin UI takes
-# effect on the *next* firmware wipe.
+# Wipe-recovery branch: if the binary is gone entirely AND we have a
+# config backup, this is a firmware-wipe scenario, not a routine boot.
+# A user who opted out of auto-updates didn't ask for their service to
+# disappear, so opting out doesn't apply here -- reinstall unconditionally.
+if [ ! -x /usr/bin/onvif-recorder ] && \
+   [ -f /data/onvif-recorder/backups/config-current.tar.gz ]; then
+    echo "wipe-recovery: /usr/bin/onvif-recorder is missing; ignoring consent gate"
+    sh /data/onvif-recorder/install.sh
+    echo "=== $(date -Is) boot-restore done (wipe-recovery) ==="
+    exit 0
+fi
+
+# Routine boot: apply the consent gate.  The file is regenerated from
+# /etc/onvif-recorder/config.json on every install/upgrade so flipping
+# autoupdate_enabled in the admin UI takes effect on the *next* boot.
 consent=$(cat /data/onvif-recorder/.autoupdate-consent 2>/dev/null)
 if [ "$consent" != "true" ]; then
     echo "auto-reinstall consent not granted (.autoupdate-consent != true)"
@@ -237,19 +248,31 @@ EOF_CRON_BACKUP
 chmod 0644 /etc/cron.d/onvif-recorder-backup
 
 # Sync the auto-reinstall consent with the admin-server setting.
+# Default is "true": running install.sh is itself an act of consent to
+# auto-recover after a firmware wipe.  The only way to land "false" is an
+# explicit `"autoupdate_enabled": false` in config.json (settable via the
+# admin UI).  Missing field, malformed file, or absent python3 all keep
+# the default-true behaviour.
 if command -v python3 >/dev/null 2>&1 && [ -f /etc/onvif-recorder/config.json ]; then
     auto=$(python3 -c '
 import json
 try:
     d = json.load(open("/etc/onvif-recorder/config.json"))
-    print("true" if d.get("autoupdate_enabled") else "false")
+    v = d.get("autoupdate_enabled")
+    # Strings "true"/"false" round-trip via the admin form; booleans round-trip
+    # via direct API.  Treat anything explicitly "false" / False as opt-out;
+    # everything else (None, "", missing) as consent.
+    if v is False or (isinstance(v, str) and v.lower() == "false"):
+        print("false")
+    else:
+        print("true")
 except Exception:
-    print("false")
-' 2>/dev/null || echo false)
+    print("true")
+' 2>/dev/null || echo true)
 else
-    auto=false
+    auto=true
 fi
-echo "${auto:-false}" > "$DATA_DIR/.autoupdate-consent"
+echo "${auto:-true}" > "$DATA_DIR/.autoupdate-consent"
 
 echo ""
 echo "==> Recovery layer at $DATA_DIR (boot auto-reinstall: $auto)."

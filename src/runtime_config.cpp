@@ -72,6 +72,26 @@ const std::vector<Entry>& Schema() {
     {"poll_interval_sec", Type::Int,
      "Seconds between motion-event poll cycles for first-party cameras.",
      "First-party cameras"},
+    {"first_party_always_smart_detect", Type::Bool,
+     "Write a smartDetectZone event for EVERY motion event from an opted-in "
+     "first-party camera, even when NanoDet-M doesn't find a security-relevant "
+     "subject.  Lets the Protect UI's smart-detect filter surface every motion "
+     "instead of silently dropping the ones the on-device AI doesn't recognise.  "
+     "Default on.  Disable to revert to the older skip-on-no-detection behaviour.",
+     "First-party cameras"},
+    {"first_party_fallback_class", Type::String,
+     "smartDetectType used when --first_party_always_smart_detect=true and "
+     "NanoDet-M couldn't classify the motion event.  Default 'person'.  "
+     "Other accepted values: 'vehicle', 'animal', 'package'.",
+     "First-party cameras"},
+    {"motion_backfill_days", Type::Int,
+     "On startup, retry NanoDet-M classification on motion events from the "
+     "last N days that didn't produce a smartDetectZone (e.g. because of "
+     "older code paths that lost detections to Protect's 640x360 snapshot "
+     "endpoint).  Events with an existing overlapping smartDetectZone are "
+     "skipped automatically; alarm notifications are suppressed for events "
+     "older than 60 seconds.  Default 7.  Set to 0 to disable.",
+     "First-party cameras"},
 
     // ---- Cameras ----
     {"rtsp_audio", Type::String,
@@ -103,6 +123,29 @@ const std::vector<Entry>& Schema() {
      "Verbose log level (INFO and above).  Disabled by default writes only "
      "errors.",
      "Logging"},
+
+    // ---- Auto-recovery (events from on-device backups) ----
+    {"auto_recover_events", Type::Bool,
+     "On startup, restore events + detectionLabels + labels from Protect's "
+     "most recent on-device DB backup if the events table looks wiped "
+     "(oldest event much newer than oldest recording).  Gated by "
+     "Protect >= 7.1.0.  Disable if you don't want startup to touch the "
+     "DB beyond the cluster's own initialisation.",
+     "Auto-recovery"},
+    {"auto_recover_threshold_hours", Type::Int,
+     "Threshold for --auto_recover_events.  Recovery fires only when the "
+     "gap exceeds this many hours.  Default 24h.",
+     "Auto-recovery"},
+
+    // ---- Auto-update / recovery ----
+    {"autoupdate_enabled", Type::Bool,
+     "Whether the device should auto-recover the package after a firmware "
+     "wipe.  Default on.  When off, post-firmware-upgrade boots will still "
+     "restore /etc/onvif-recorder/* from the config backup but won't "
+     "re-run apt install.  Note: if /usr/bin/onvif-recorder is missing "
+     "entirely (firmware wipe scenario), the recovery layer overrides this "
+     "and reinstalls anyway -- a missing binary is recovery, not auto-update.",
+     "Auto-update"},
 
     // ---- Profiling ----
     {"cpu_profile_hz", Type::Int,
