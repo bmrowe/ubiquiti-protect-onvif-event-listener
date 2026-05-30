@@ -1084,6 +1084,9 @@ std::pair<int, std::string> handle_config(const Ctx& ctx,
 //   - event-log.jsonl    tail of --event_log file (last 5000 lines) if set
 //   - nginx-error.log    tail of /var/log/nginx/error.log
 //   - dpkg.txt           dpkg-query -W onvif-recorder, unifi-protect, etc.
+//   - dmesg.log          kernel ring buffer (dmesg -T) -- catches hardware
+//                        issues invisible to userspace: SATA link resets,
+//                        OOM kills, filesystem errors, USB hot-unplug, etc.
 //   - system.txt         uname -a, /sys/firmware/devicetree/base/model, free, df
 // Returns ok status when the tarball exists at out_path.
 absl::Status build_diagnostic_dump(const Ctx& ctx,
@@ -1149,6 +1152,15 @@ absl::Status build_diagnostic_dump(const Ctx& ctx,
   capture("dpkg.txt",
           "dpkg-query -W -f='${Package} ${Version}\\n' "
           "onvif-recorder unifi-protect unifi-core uos 2>/dev/null");
+  // Kernel ring buffer.  -T renders human-readable timestamps so triagers
+  // can correlate events without converting jiffies.  Falls back to plain
+  // dmesg if -T is unsupported by the kernel.  The kernel ring buffer is
+  // itself bounded (typically 1 MiB), well within the 8 MiB capture cap;
+  // the DumpSanitizer redacts MAC/IPv4/credentials that may appear in
+  // hardware-probe lines.
+  capture("dmesg.log",
+          "dmesg -T 2>/dev/null || dmesg 2>/dev/null "
+          "|| echo '(dmesg not readable -- requires CAP_SYSLOG)'");
   capture("system.txt",
           "uname -a; "
           "echo '---'; "
