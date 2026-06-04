@@ -10,6 +10,7 @@
 #define SRC_DUMP_SANITIZER_HPP_
 
 #include <map>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -36,15 +37,30 @@ namespace onvif {
 //   - HTTP basic credentials embedded in URLs (scheme://user:pass@host)
 //     and "Authorization: Basic <b64>" headers are replaced.
 //   - "X-UserId: <id>" and similar ID headers are replaced.
+//   - User-given camera names that the caller has registered via
+//     register_camera_name() are replaced with a deterministic
+//     "Camera-<8hex>" hash of the name.  Names are personally
+//     identifying (people use real room / family names) and leak
+//     through both JSON outputs (camera_health.json,
+//     recent_events.json) and the journal log.  Hashing rather than
+//     keeping a name->label map means original names never sit in
+//     memory longer than the call that registers them.
 class DumpSanitizer {
  public:
   // Returns the sanitised version of @p in.  Stateful: subsequent
-  // calls reuse the same IP and credential mappings.
+  // calls reuse the same IP, credential, and camera-name mappings.
   std::string sanitize(const std::string& in);
 
   // Test seam: explicitly remap an IPv4 address and return the result.
   // Returns @p ip unchanged if it doesn't parse as a 0-255 quad.
   std::string remap_ip(const std::string& ip);
+
+  // Register a camera name to redact.  Returns the anonymised label
+  // ("Camera-<8 hex chars of FNV-1a of name>") that subsequent
+  // sanitize() calls will substitute every occurrence of @p name
+  // with.  Deterministic across runs and machines so dumps from the
+  // same device line up.  No-op for empty / whitespace-only names.
+  std::string register_camera_name(const std::string& name);
 
  private:
   // Per-prefix counter trie: at each octet position, a counter is
@@ -56,6 +72,12 @@ class DumpSanitizer {
 
   // Cache of fully-resolved IP -> sanitised IP for repeat lookups.
   std::map<std::string, std::string> ip_cache_;
+
+  // Set of registered camera names.  Iterated in sanitize() and
+  // substituted literally (not as regex) with their deterministic
+  // hash label, longest first to avoid substring collisions
+  // ("Lincoln" inside "Lincoln Doorbell").
+  std::set<std::string> camera_names_;
 };
 
 }  // namespace onvif

@@ -8,6 +8,9 @@
 
 #include "dump_sanitizer.hpp"
 
+#include <algorithm>
+#include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <regex>
 #include <string>
@@ -15,6 +18,58 @@
 #include <vector>
 
 namespace onvif {
+
+namespace {
+
+bool is_blank(const std::string& s) {
+  for (char c : s) {
+    if (!std::isspace(static_cast<unsigned char>(c))) return false;
+  }
+  return true;
+}
+
+// In-place literal find-and-replace.  Used for camera-name redaction
+// where the search string may contain regex meta-characters and we
+// don't want them interpreted.
+void replace_all(std::string& s,
+                  const std::string& needle,
+                  const std::string& with) {
+  if (needle.empty()) return;
+  size_t pos = 0;
+  while ((pos = s.find(needle, pos)) != std::string::npos) {
+    s.replace(pos, needle.size(), with);
+    pos += with.size();
+  }
+}
+
+// FNV-1a 32-bit.  Deterministic across runs / machines and small
+// enough to render as 8 hex characters.  Not cryptographic — the
+// goal is to anonymise display, not to be irreversible against a
+// dictionary attack.  A motivated reader with the original camera
+// list could rehash and match, which is acceptable for diagnostics
+// shared with the project owner.
+std::string fnv1a_hex8(const std::string& s) {
+  uint32_t h = 0x811c9dc5u;
+  for (unsigned char c : s) {
+    h ^= c;
+    h *= 0x01000193u;
+  }
+  char buf[9];
+  std::snprintf(buf, sizeof(buf), "%08x", h);
+  return std::string(buf);
+}
+
+std::string camera_label(const std::string& name) {
+  return "Camera-" + fnv1a_hex8(name);
+}
+
+}  // namespace
+
+std::string DumpSanitizer::register_camera_name(const std::string& name) {
+  if (name.empty() || is_blank(name)) return name;
+  camera_names_.insert(name);
+  return camera_label(name);
+}
 
 std::string DumpSanitizer::remap_ip(const std::string& ip) {
   auto cached = ip_cache_.find(ip);
@@ -138,6 +193,23 @@ std::string DumpSanitizer::sanitize(const std::string& in) {
       R"((X-UserId:\s*)([A-Za-z0-9._\-]+))",
       std::regex::icase);
   out = std::regex_replace(out, xuserid_re, "$1[REDACTED]");
+
+  // -------- Registered camera names --------
+  // Substitute longest names first to avoid swallowing parts of longer
+  // names ("Lincoln" within "Lincoln Doorbell").  Literal replacement so
+  // names with regex meta-characters (apostrophes, parentheses, etc.)
+  // work correctly.
+  if (!camera_names_.empty()) {
+    std::vector<std::string> by_len(
+        camera_names_.begin(), camera_names_.end());
+    std::sort(by_len.begin(), by_len.end(),
+              [](const std::string& a, const std::string& b) {
+                return a.size() > b.size();
+              });
+    for (const std::string& name : by_len) {
+      replace_all(out, name, camera_label(name));
+    }
+  }
 
   return out;
 }

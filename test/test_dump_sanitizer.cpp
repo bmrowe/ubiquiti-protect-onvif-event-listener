@@ -174,6 +174,77 @@ static void test_sanitize_user_kv() {
         "port preserved");
 }
 
+// Test names are deliberately generic placeholders ("Lincoln", "Hayes",
+// "Polk"), not values borrowed from any real deployment, so the source
+// tree never grows a personally-identifying camera name even by mistake.
+static void test_register_camera_name_basic() {
+  onvif::DumpSanitizer s;
+  const std::string label_a = s.register_camera_name("Lincoln");
+  const std::string label_b = s.register_camera_name("Hayes");
+  // Labels are the deterministic hash form, distinct per name.
+  check(label_a.rfind("Camera-", 0) == 0,
+        "label has Camera- prefix");
+  check(label_a.size() == 7 + 8,  // "Camera-" + 8 hex chars
+        "label is 15 chars total");
+  check(label_a != label_b,
+        "distinct names get distinct labels");
+  // Idempotent: same name -> same label.
+  check(s.register_camera_name("Lincoln") == label_a,
+        "duplicate name reuses label");
+  // Empty / whitespace names are no-ops, returned unchanged.
+  check(s.register_camera_name("") == "",
+        "empty name returned unchanged");
+  check(s.register_camera_name("   ") == "   ",
+        "whitespace name returned unchanged");
+}
+
+static void test_sanitize_camera_names() {
+  onvif::DumpSanitizer s;
+  const std::string label_a = s.register_camera_name("Lincoln");
+  const std::string label_b = s.register_camera_name("Hayes");
+  const std::string in =
+      "{\"name\":\"Lincoln\",\"events_1h\":3}\n"
+      "msg: motion at Hayes at 19:24\n"
+      "another note about Lincoln\n";
+  const std::string out = s.sanitize(in);
+  check(out.find("Lincoln") == std::string::npos,
+        "first name redacted everywhere");
+  check(out.find("Hayes") == std::string::npos,
+        "second name redacted");
+  check(out.find(label_a) != std::string::npos &&
+        out.find(label_b) != std::string::npos,
+        "hashed labels present");
+}
+
+static void test_sanitize_camera_name_longest_first() {
+  onvif::DumpSanitizer s;
+  // Register the substring first.  Longest-first sort must still
+  // protect the longer name from being chewed up.
+  const std::string short_label = s.register_camera_name("Polk");
+  const std::string long_label  = s.register_camera_name("Polk Doorbell");
+  const std::string out = s.sanitize(
+      "Polk Doorbell tripped; Polk motion later.\n");
+  // The longer name must be replaced as a whole.
+  check(out.find("Polk Doorbell") == std::string::npos,
+        "longer name fully redacted");
+  check(out.find("Polk motion") == std::string::npos,
+        "shorter name redacted separately");
+  check(out.find(long_label) != std::string::npos,
+        "longer name maps to its hash label");
+  check(out.find(short_label + " motion") != std::string::npos,
+        "shorter standalone occurrence maps to its own hash label");
+}
+
+static void test_sanitize_camera_name_deterministic() {
+  // Two independent sanitisers see the same name -> same label.
+  // Guards against accidental introduction of run-local state in the
+  // hashing path (e.g. a per-instance counter).
+  onvif::DumpSanitizer a;
+  onvif::DumpSanitizer b;
+  check(a.register_camera_name("Tyler") == b.register_camera_name("Tyler"),
+        "hash label is deterministic across instances");
+}
+
 int main() {
   test_ip_remap_basic();
   test_ip_remap_consistent();
@@ -187,6 +258,10 @@ int main() {
   test_sanitize_basic_auth_header();
   test_sanitize_xuserid();
   test_sanitize_user_kv();
+  test_register_camera_name_basic();
+  test_sanitize_camera_names();
+  test_sanitize_camera_name_longest_first();
+  test_sanitize_camera_name_deterministic();
 
   std::cout << "test_dump_sanitizer: " << g_pass << " passed, "
             << g_fail << " failed\n";

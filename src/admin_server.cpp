@@ -1100,6 +1100,20 @@ absl::Status build_diagnostic_dump(const Ctx& ctx,
   // credential maps to the same redacted value across files.
   DumpSanitizer san;
 
+  // Pre-register user-given camera names so they get redacted in every
+  // file the sanitiser touches (camera_health.json, recent_events.json,
+  // journal.log, raw-onvif.jsonl).  User-chosen names are personally
+  // identifying (real people / room labels) and were leaking through
+  // diagnostic dumps before this hook.
+  if (ctx.db != nullptr) {
+    auto rows_or = unifi::load_camera_health(*ctx.db);
+    if (rows_or.ok()) {
+      for (const auto& r : *rows_or) {
+        san.register_camera_name(r.name);
+      }
+    }
+  }
+
   // Helper: sanitise then write content to a file inside dir.
   auto write = [&dir, &san](const char* name, const std::string& content) {
     std::ofstream f(dir + "/" + name, std::ios::binary | std::ios::trunc);
