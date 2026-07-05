@@ -31,6 +31,8 @@
 
 namespace onvif {
 
+class ProtectUserIdProvider;  // fwd-decl; used via pointer only
+
 class AlarmNotifier;  // forward declaration; full definition in alarm_notifier.hpp
 class MsrClient;      // forward declaration; full definition in msr_client.hpp
 
@@ -274,6 +276,24 @@ class DetectionRecorder {
   /// thumbnail.  Set to 0 to disable (default 0 — legacy behaviour:
   /// every event makes its own MSR call).
   void set_msr_burst_window_ms(uint64_t ms);
+
+  /// Configure the Protect API base URL + X-UserId provider used to
+  /// fetch snapshots via Protect's own `/api/cameras/<id>/snapshot?ts=`
+  /// endpoint for cameras opted-in via set_camera_snapshot_via_protect().
+  /// A camera that has that opt-in but is missing either the base URL
+  /// or the provider falls back to the direct-HTTP path.
+  void set_protect_snapshot_source(
+      const std::string& base_url,
+      onvif::ProtectUserIdProvider* provider);
+
+  /// Route snapshot fetches for @p camera_ip through Protect's API
+  /// instead of the camera's HTTP snapshot endpoint.  Intended for
+  /// cameras with strict concurrent-HTTP-session limits (many Amcrest /
+  /// Dahua firmwares) where hitting the /snapshot URL while RTSP is
+  /// streaming causes 5xx or timeout.  Protect internally sources these
+  /// from MSR (or a live frame from the recording pipeline), so no
+  /// additional HTTP session is opened against the camera.
+  void set_camera_snapshot_via_protect(const std::string& camera_ip);
 
   /// Test observability — number of times MSR was actually contacted
   /// vs. how many events triggered an MSR-eligible path.  Reset by the
@@ -540,6 +560,19 @@ class DetectionRecorder {
   // the snapshot URL to http://<camera_ip><path> instead of using the URL the
   // camera advertised via ONVIF.
   std::map<std::string, std::string> camera_snapshot_url_paths_;
+
+  // Cameras opted-in to Protect-sourced snapshots via
+  // set_camera_snapshot_via_protect().  When present, on_event() bypasses
+  // the direct HTTP snapshot fetch and instead calls Protect's own
+  // /api/cameras/<id>/snapshot?ts=<ms> endpoint.  Useful for cameras with
+  // strict concurrent-HTTP-session limits (Amcrest / Dahua firmwares).
+  std::set<std::string> camera_snapshot_via_protect_;
+
+  // Protect API base + X-UserId provider, plumbed via
+  // set_protect_snapshot_source(); required whenever
+  // camera_snapshot_via_protect_ is non-empty.
+  std::string protect_url_;
+  onvif::ProtectUserIdProvider* protect_user_id_provider_{nullptr};
 
   // Coalescing: last completed event per (camera_ip, detection_type).
   // real_end_ms is the wall-clock time (ms) when the detection ended, without

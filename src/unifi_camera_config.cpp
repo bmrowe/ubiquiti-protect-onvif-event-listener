@@ -16,9 +16,11 @@
 
 #include <libpq-fe.h>
 
+#include <cstdint>
 #include <cstring>
 #include <map>
 #include <set>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -196,7 +198,9 @@ absl::StatusOr<std::vector<onvif::CameraConfig>> load_cameras(
     return absl::InternalError("unifi::load_cameras: " + pg.error());
 
   const char* sql =
-    "SELECT id, mac, host, \"thirdPartyCameraInfo\", COALESCE(type, '') "
+    "SELECT id, mac, host, \"thirdPartyCameraInfo\", COALESCE(type, ''), "
+    "       COALESCE(channels::text, '[]'), "
+    "       COALESCE(\"videoCodec\", '') "
     "FROM cameras "
     "WHERE \"isThirdPartyCamera\" = true "
     "  AND \"isAdopted\" = true "
@@ -217,6 +221,8 @@ absl::StatusOr<std::vector<onvif::CameraConfig>> load_cameras(
     const char* host_c = PQgetvalue(res, i, 2);
     const char* info_c = PQgetvalue(res, i, 3);
     const char* type_c = PQgetvalue(res, i, 4);
+    const char* chan_c   = PQgetvalue(res, i, 5);
+    const char* vcodec_c = PQgetvalue(res, i, 6);
     if (!id_c || !host_c || !info_c || PQgetisnull(res, i, 2)) continue;
 
     std::string info(info_c);
@@ -243,6 +249,112 @@ absl::StatusOr<std::vector<onvif::CameraConfig>> load_cameras(
                   << camera_type << " (" << ip << "): "
                   << snapshot_url << " -> " << fixed;
         snapshot_url = fixed;
+      }
+    }
+
+    // Per-channel video-feed characteristics.  Codec, resolution,
+    // frame rate, bitrate control mode, and IDR (keyframe) interval
+    // are the fields that most often drive playback-pipeline failures
+    // (e.g. H.265 substream that MSR can decode a still from but
+    // can't repackage into fmp4 fragments -- issue #34 territory).
+    // Fields come from Protect's `channels` JSONB column verbatim.
+    // Small hand-parse so we don't drag a JSON dep into this path;
+    // channels is an array of flat objects at top level.
+    //
+    // Field notes:
+    //   * videoCodec may sit inside the channel object OR at the
+    //     camera level (varies by camera type); we look for it both
+    //     places.  Missing -> "?".
+    //   * autoBitrate=true means VBR; false means CBR.
+    //   * idrInterval is the keyframe / GOP interval in seconds.
+    //   * Protect's channels don't expose an explicit b-frame count
+    //     -- IDR interval is the closest proxy we can log.
+    if (chan_c && *chan_c) {
+      const std::string chan = chan_c;
+      // Camera-level fallback for videoCodec.  Protect exposes
+      // `videoCodec` as a top-level column on cameras (h264 / h265),
+      // and individual channels can also declare their own codec.
+      // Prefer per-channel; fall back to the row-level value.
+      const std::string camera_codec = vcodec_c ? vcodec_c : "";
+      // Iterate top-level {} objects in the array.
+      auto scan_object = [&](const std::string& obj) {
+        auto get_str = [&](const char* key) -> std::string {
+          const std::string needle = std::string("\"") + key + "\":\"";
+          const size_t p = obj.find(needle);
+          if (p == std::string::npos) return {};
+          const size_t s = p + needle.size();
+          const size_t e = obj.find('"', s);
+          return e == std::string::npos ? std::string()
+                                        : obj.substr(s, e - s);
+        };
+        auto get_int = [&](const char* key) -> int64_t {
+          const std::string needle = std::string("\"") + key + "\":";
+          size_t p = obj.find(needle);
+          if (p == std::string::npos) return -1;
+          p += needle.size();
+          while (p < obj.size() && (obj[p] == ' ' || obj[p] == '\t')) ++p;
+          bool neg = false;
+          if (p < obj.size() && obj[p] == '-') { neg = true; ++p; }
+          int64_t v = 0;
+          bool ok = false;
+          while (p < obj.size() && obj[p] >= '0' && obj[p] <= '9') {
+            v = v * 10 + (obj[p] - '0'); ok = true; ++p;
+          }
+          return ok ? (neg ? -v : v) : -1;
+        };
+        auto get_bool = [&](const char* key) -> int {
+          const std::string needle = std::string("\"") + key + "\":";
+          const size_t p = obj.find(needle);
+          if (p == std::string::npos) return -1;
+          const size_t s = p + needle.size();
+          if (obj.compare(s, 4, "true")  == 0) return 1;
+          if (obj.compare(s, 5, "false") == 0) return 0;
+          return -1;
+        };
+
+        const int64_t ch_id = get_int("id");
+        if (ch_id < 0) return;  // not an actual channel object
+        const std::string name    = get_str("name");
+        const int64_t width       = get_int("width");
+        const int64_t height      = get_int("height");
+        const int64_t fps         = get_int("fps");
+        const int64_t bitrate_bps = get_int("bitrate");
+        const int64_t idr_sec     = get_int("idrInterval");
+        const int auto_bitrate    = get_bool("autoBitrate");
+        std::string codec         = get_str("videoCodec");
+        if (codec.empty()) codec = camera_codec;
+        if (codec.empty()) codec = "?";
+        const std::string rc =
+            auto_bitrate == 1 ? "VBR" :
+            auto_bitrate == 0 ? "CBR" : "rc=?";
+        std::ostringstream os;
+        os << "[unifi_camera_config] " << camera_type << " " << ip
+           << " ch" << ch_id;
+        if (!name.empty()) os << " (" << name << ")";
+        os << ": ";
+        if (width > 0 && height > 0) os << width << "x" << height;
+        else os << "??x??";
+        os << " " << codec;
+        if (fps > 0) os << " " << fps << "fps";
+        if (bitrate_bps > 0) os << " " << (bitrate_bps / 1000) << "kbps";
+        if (idr_sec > 0) os << " IDR=" << idr_sec << "s";
+        os << " " << rc;
+        LOG(INFO) << os.str();
+      };
+
+      size_t depth = 0;
+      size_t obj_start = std::string::npos;
+      for (size_t i = 0; i < chan.size(); ++i) {
+        if (chan[i] == '{') {
+          if (depth == 0) obj_start = i;
+          ++depth;
+        } else if (chan[i] == '}') {
+          if (depth > 0) --depth;
+          if (depth == 0 && obj_start != std::string::npos) {
+            scan_object(chan.substr(obj_start, i - obj_start + 1));
+            obj_start = std::string::npos;
+          }
+        }
       }
     }
 

@@ -46,6 +46,7 @@
 #include "jpeg_crop.hpp"
 #include "msr_client.hpp"
 #include "object_detect.hpp"
+#include "protect_user_id_provider.hpp"
 #include "ubv_thumbnail.hpp"
 
 namespace onvif {
@@ -169,9 +170,13 @@ static size_t curl_write_cb(void* data, size_t size, size_t nmemb, void* userp) 
   return total;
 }
 
-static std::vector<unsigned char> fetch_snapshot(const std::string& url,
-                                                  const std::string& user,
-                                                  const std::string& password) {
+// Single HTTP GET attempt with optional Basic/Digest auth.  Returns
+// empty on any non-200 or transport error.  Called by fetch_snapshot()
+// which layers an anonymous-fallback retry on top.
+static std::vector<unsigned char> fetch_snapshot_once(
+    const std::string& url,
+    const std::string& user,
+    const std::string& password) {
   std::vector<unsigned char> buf;
   CURL* curl = curl_easy_init();
   if (!curl) return buf;
@@ -195,7 +200,8 @@ static std::vector<unsigned char> fetch_snapshot(const std::string& url,
     long http_code = 0;  // NOLINT(runtime/int)
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     if (http_code != 200) {
-      LOG(WARNING) << "[snapshot] HTTP " << http_code << " from " << url;
+      LOG(WARNING) << "[snapshot] HTTP " << http_code << " from " << url
+                   << (user.empty() ? " (anon)" : " (auth)");
       buf.clear();
     }
   } else {
@@ -205,6 +211,97 @@ static std::vector<unsigned char> fetch_snapshot(const std::string& url,
   }
 
   curl_easy_cleanup(curl);
+  return buf;
+}
+
+// Single HTTP GET against Protect's /api/... with an X-UserId header
+// derived from @p user_id.  Populates @p http_code with the response
+// code (0 on transport error).  Returns the response body or empty on
+// any failure.
+static std::vector<unsigned char> fetch_via_protect_once(
+    const std::string& url,
+    const std::string& user_id,
+    long* http_code) {  // NOLINT(runtime/int)
+  *http_code = 0;
+  std::string buf;
+  CURL* curl = curl_easy_init();
+  if (!curl) return {};
+  struct curl_slist* hdrs = nullptr;
+  const std::string user_hdr = "X-UserId: " + user_id;
+  hdrs = curl_slist_append(hdrs, user_hdr.c_str());
+  hdrs = curl_slist_append(hdrs, "X-Source: unifi-os");
+  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);  // NOLINT(runtime/int)
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);  // NOLINT(runtime/int)
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
+      +[](char* p, size_t s, size_t n, void* ud) -> size_t {
+        static_cast<std::string*>(ud)->append(p, s * n);
+        return s * n;
+      });
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+  const CURLcode rc = curl_easy_perform(curl);
+  if (rc == CURLE_OK)
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, http_code);
+  curl_slist_free_all(hdrs);
+  curl_easy_cleanup(curl);
+  if (rc != CURLE_OK) {
+    LOG(WARNING) << "[snapshot] via-protect curl error: "
+                 << curl_easy_strerror(rc) << " for " << url;
+    return {};
+  }
+  return *http_code == 200
+             ? std::vector<unsigned char>(buf.begin(), buf.end())
+             : std::vector<unsigned char>{};
+}
+
+// GET Protect's /api/cameras/<id>/snapshot?ts=<ms> with X-UserId auth.
+// Returns bytes on 200 or empty on failure.  On 401 asks the provider
+// to re-discover the user_id and retries once -- matches
+// motion_poller::fetch_camera_snapshot_at_ts.
+static std::vector<unsigned char> fetch_via_protect(
+    const std::string& base_url,
+    onvif::ProtectUserIdProvider* provider,
+    const std::string& cam_uuid,
+    uint64_t ts_ms) {
+  if (base_url.empty() || !provider || cam_uuid.empty()) return {};
+  const std::string user_id = provider->current();
+  if (user_id.empty()) return {};
+  const std::string url = base_url + "/api/cameras/" + cam_uuid +
+                          "/snapshot?ts=" + std::to_string(ts_ms);
+  long http_code = 0;  // NOLINT(runtime/int)
+  auto body = fetch_via_protect_once(url, user_id, &http_code);
+  if (!body.empty()) return body;
+  if (http_code == 401 && provider->try_refresh()) {
+    LOG(INFO) << "[snapshot] via-protect 401; retrying after user_id refresh";
+    body = fetch_via_protect_once(url, provider->current(), &http_code);
+    if (!body.empty()) return body;
+  }
+  if (http_code != 0) {
+    LOG(WARNING) << "[snapshot] via-protect HTTP " << http_code
+                 << " from " << url;
+  }
+  return body;
+}
+
+// Fetch a camera snapshot with credentials, falling back to an
+// unauthenticated GET on failure.  Common on cameras whose HTTP
+// snapshot endpoint accepts anonymous requests even though ONVIF
+// requires WSSE, and rescues installs where Protect stored corrupt
+// credentials (field-observed on issue #34: literal single-space
+// username + password stored in cameras.thirdPartyCameraInfo).
+static std::vector<unsigned char> fetch_snapshot(const std::string& url,
+                                                  const std::string& user,
+                                                  const std::string& password) {
+  std::vector<unsigned char> buf = fetch_snapshot_once(url, user, password);
+  if (buf.empty() && !user.empty()) {
+    LOG(INFO) << "[snapshot] auth fetch of " << url
+              << " failed; retrying anonymously";
+    buf = fetch_snapshot_once(url, "", "");
+    if (!buf.empty()) {
+      LOG(INFO) << "[snapshot] anonymous fetch of " << url << " succeeded";
+    }
+  }
   return buf;
 }
 
@@ -1219,6 +1316,10 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     std::string burst_cached_id;  // empty if no recent id within window
     // Non-empty when merging this detection into an existing event row.
     std::string coalesced_event_id;
+    // Snapshot-source routing captured under the lock (see below).
+    bool        snap_via_protect = false;
+    std::string protect_url_copy;
+    onvif::ProtectUserIdProvider* protect_user_id_provider_copy = nullptr;
     {
       absl::MutexLock lk(&mu_);
 
@@ -1304,6 +1405,10 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
       msr          = msr_client_;
       msr_drop_on_failure = msr_drop_on_failure_;
       msr_burst_window_ms = msr_burst_window_ms_;
+      snap_via_protect =
+          camera_snapshot_via_protect_.count(ev.camera_ip) > 0;
+      protect_url_copy = protect_url_;
+      protect_user_id_provider_copy = protect_user_id_provider_;
       // Probe the burst cache while we still hold the lock.  We can't
       // know the camera_mac yet (cit/mit lookups happen above this
       // line so cam_mac is set), so do this after camera-mac resolution.
@@ -1335,15 +1440,40 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     std::string obj_type   = sdo_type(det->type);
 
     // 3. Fetch snapshot if the backend needs it.
+    //
+    // Two possible sources:
+    //   * Direct HTTP against the camera's own snapshot endpoint
+    //     (snap_url + snap_user/pass).  Default path.
+    //   * Protect's own /api/cameras/<id>/snapshot?ts=<ms> endpoint,
+    //     when the camera IP is in --camera_snapshot_via_protect.
+    //     Bypasses direct HTTP sessions -- useful for Amcrest/Dahua
+    //     firmwares that limit concurrent HTTP and drop snapshot
+    //     requests while RTSP is active (issue #34, field-observed).
+    //     Falls back to the direct path if Protect can't serve it.
     std::vector<unsigned char> snapshot;
-    if (db_->needs_snapshot() && !snap_url.empty()) {
-      LOG(INFO) << '[' << ev.camera_ip << "] fetching snapshot from "
-                << snap_url;
-      snapshot = fetch_snapshot(snap_url, snap_user, snap_pass);
+    if (db_->needs_snapshot() && (!snap_url.empty() || snap_via_protect)) {
+      if (snap_via_protect && !protect_url_copy.empty() &&
+          protect_user_id_provider_copy && !cam_uuid.empty()) {
+        LOG(INFO) << '[' << ev.camera_ip
+                  << "] fetching snapshot via Protect API for camera "
+                  << cam_uuid;
+        snapshot = fetch_via_protect(protect_url_copy,
+                                     protect_user_id_provider_copy,
+                                     cam_uuid, ts_ms);
+        if (snapshot.empty() && !snap_url.empty()) {
+          LOG(INFO) << '[' << ev.camera_ip
+                    << "] via-Protect fetch failed; falling back to "
+                    << snap_url;
+        }
+      }
+      if (snapshot.empty() && !snap_url.empty()) {
+        LOG(INFO) << '[' << ev.camera_ip << "] fetching snapshot from "
+                  << snap_url;
+        snapshot = fetch_snapshot(snap_url, snap_user, snap_pass);
+      }
       if (snapshot.empty()) {
         LOG(WARNING) << '[' << ev.camera_ip << "] snapshot fetch failed or "
-                     << "returned empty from " << snap_url
-                     << " (thumbnail will be missing)";
+                     << "returned empty (thumbnail will be missing)";
       } else {
         LOG(INFO) << '[' << ev.camera_ip << "] snapshot fetched: "
                   << snapshot.size() << " bytes";
@@ -1737,6 +1867,20 @@ void DetectionRecorder::set_camera_snapshot_url_path(const std::string& ip,
     camera_snapshot_url_paths_.erase(ip);
   else
     camera_snapshot_url_paths_[ip] = path;
+}
+
+void DetectionRecorder::set_protect_snapshot_source(
+    const std::string& base_url,
+    onvif::ProtectUserIdProvider* provider) {
+  absl::MutexLock lk(&mu_);
+  protect_url_               = base_url;
+  protect_user_id_provider_  = provider;
+}
+
+void DetectionRecorder::set_camera_snapshot_via_protect(
+    const std::string& camera_ip) {
+  absl::MutexLock lk(&mu_);
+  camera_snapshot_via_protect_.insert(camera_ip);
 }
 
 }  // namespace onvif

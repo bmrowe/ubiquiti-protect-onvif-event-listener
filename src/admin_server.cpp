@@ -123,8 +123,15 @@ font-weight:600;text-transform:uppercase;letter-spacing:.04em}
 <th style="padding:4px 6px">Role</th>
 <th style="padding:4px 6px">Last event</th>
 <th style="padding:4px 6px">1h</th>
-<th style="padding:4px 6px"></th></tr></thead>
-<tbody id="camhealth-body"><tr><td colspan="6">Loading…</td></tr></tbody></table></div>
+<th style="padding:4px 6px"></th>
+<th style="padding:4px 6px" title="Route thumbnail fetches through Protect's own snapshot API instead of hitting the camera directly. Useful for cameras that struggle with concurrent requests. Third-party cameras only.">Via Protect</th>
+</tr></thead>
+<tbody id="camhealth-body"><tr><td colspan="7">Loading…</td></tr></tbody></table>
+<div style="margin-top:8px;display:flex;gap:12px;align-items:center">
+  <button id="save-via-protect" onclick="saveViaProtect()" disabled
+          style="padding:4px 12px;font-size:12px">Save via-Protect changes</button>
+  <span id="save-via-protect-msg" style="font-size:12px;color:#9aa0a6"></span>
+</div></div>
 
 <div class="card"><h2>Release channel</h2>
 <div class="row"><label>APT suite used for upgrades</label>
@@ -296,6 +303,7 @@ function renderConfigForm(entries){
   let html = '';
   for (const e of entries){
     if (e.name === 'first_party_cameras') continue;  // rendered separately
+    if (e.name === 'camera_snapshot_via_protect') continue;  // rendered as tickboxes on the Camera Health card
     if (e.group !== lastGroup){
       html += `<div class="cfg-section">${e.group}</div>`;
       lastGroup = e.group;
@@ -361,6 +369,7 @@ async function saveConfig(){
   const values = {};
   for (const e of configEntries){
     if (e.name === 'first_party_cameras') continue;
+    if (e.name === 'camera_snapshot_via_protect') continue;  // saved by the tickbox flow
     const el = document.getElementById('cfg-' + e.name);
     if (el) values[e.name] = el.value || '';
   }
@@ -427,20 +436,65 @@ function fmtBackoff(sec){
   if (sec < 3600)    return Math.floor(sec/60) + 'm';
   return Math.floor(sec/3600) + 'h';
 }
+// via-Protect tick-box state.  Reset from server on every fetch; tracks
+// user edits so the Save button can commit them.  Keyed by camera IP
+// because that is the value shape camera_snapshot_via_protect uses.
+let viaProtectServer = new Set();  // as-persisted on server
+let viaProtectLocal  = new Set();  // includes unsaved changes
+
+function updateSaveViaProtectState(){
+  const dirty = viaProtectServer.size !== viaProtectLocal.size
+             || [...viaProtectLocal].some(ip => !viaProtectServer.has(ip));
+  const btn = document.getElementById('save-via-protect');
+  if (btn) btn.disabled = !dirty;
+  const msg = document.getElementById('save-via-protect-msg');
+  if (msg && !dirty) msg.textContent = '';
+}
+function toggleViaProtect(host, checked){
+  if (checked) viaProtectLocal.add(host); else viaProtectLocal.delete(host);
+  updateSaveViaProtectState();
+}
+async function saveViaProtect(){
+  const csv = [...viaProtectLocal].sort().join(',');
+  const msg = document.getElementById('save-via-protect-msg');
+  const sp  = document.getElementById('spinner');
+  document.getElementById('spinner-text').textContent =
+      'Saving snapshot routing and restarting service…';
+  sp.classList.add('on');
+  try {
+    const r = await post('api/config', { camera_snapshot_via_protect: csv });
+    if (!r.ok) { if (msg) msg.textContent = r.text; sp.classList.remove('on'); return; }
+    await waitForRestart();
+    await loadCameraHealth();
+    if (msg) { msg.textContent = 'Saved.'; msg.style.color = '#a0e0a0'; }
+  } finally {
+    sp.classList.remove('on');
+  }
+}
+
 async function loadCameraHealth(){
   try {
     const r = captureCsrf(await fetch('api/camera_health'));
     const j = await r.json();
     const body = document.getElementById('camhealth-body');
     if (!j.cameras || !j.cameras.length){
-      body.innerHTML = '<tr><td colspan="6" style="color:#7a8190">No adopted cameras.</td></tr>';
+      body.innerHTML = '<tr><td colspan="7" style="color:#7a8190">No adopted cameras.</td></tr>';
       return;
     }
+    // Re-seed via-Protect state from server, but preserve any local
+    // pending edits that haven't been saved yet.
+    const wasDirty = document.getElementById('save-via-protect')?.disabled === false;
+    const nextServer = new Set();
+    for (const c of j.cameras)
+      if (c.is_third_party && c.snapshot_via_protect) nextServer.add(c.host);
+    viaProtectServer = nextServer;
+    if (!wasDirty) viaProtectLocal = new Set(viaProtectServer);
+    updateSaveViaProtectState();
     const now = j.now_ms || Date.now();
     body.innerHTML = j.cameras.map(c => {
       const age = c.last_event_ms ? (now - c.last_event_ms) : null;
       const hintRow = c.hint === 'needs_onvif_admin'
-        ? `<tr><td colspan="6" style="padding:4px 6px 8px 22px;color:#f0c674;font-size:11px;border-top:0">
+        ? `<tr><td colspan="7" style="padding:4px 6px 8px 22px;color:#f0c674;font-size:11px;border-top:0">
              &#9888; ONVIF event subscription rejected with <code>ter:NotAuthorized</code>.
              Most Hikvision firmware (and OEM rebadges) require a separate ONVIF user with
              <b>Administrator</b> privileges -- web-UI admin alone is not enough.
@@ -455,6 +509,13 @@ async function loadCameraHealth(){
       const backoffPill = (c.pull_backoff_sec && c.pull_backoff_sec > 0)
         ? ` <span class="pill yellow" title="Camera returns empty pulls instantly instead of honoring our 5s long-poll; backed off to protect it from over-polling. Resets automatically on the next event or long-poll response.">backoff ${fmtBackoff(c.pull_backoff_sec)}</span>`
         : '';
+      // Via-Protect tickbox: third-party only.  First-party cameras use
+      // Protect's native pipeline so this workaround doesn't apply.
+      const checked = viaProtectLocal.has(c.host) ? 'checked' : '';
+      const viaCell = c.is_third_party
+        ? `<input type="checkbox" ${checked}
+                  onchange="toggleViaProtect('${c.host}', this.checked)">`
+        : '<span style="color:#5a6070">—</span>';
       return `<tr>
         <td style="padding:4px 6px">${c.name || '(unnamed)'}</td>
         <td style="padding:4px 6px;color:#9aa0a6">${c.host || '-'}</td>
@@ -464,11 +525,12 @@ async function loadCameraHealth(){
         <td style="padding:4px 6px">${c.hint === 'needs_onvif_admin'
             ? '<span class="pill red">auth</span>'
             : pillFor(age)}${backoffPill}</td>
+        <td style="padding:4px 6px;text-align:center">${viaCell}</td>
       </tr>${hintRow}`;
     }).join('');
   } catch (e) {
     document.getElementById('camhealth-body').innerHTML =
-      '<tr><td colspan="6" style="color:#e0a0a0">Failed to load camera health.</td></tr>';
+      '<tr><td colspan="7" style="color:#e0a0a0">Failed to load camera health.</td></tr>';
   }
 }
 
@@ -975,6 +1037,32 @@ std::string build_camera_health_json(const Ctx& ctx) {
       health_by_ip[ip] = std::move(h);
     }
   }
+  // Load the persisted camera_snapshot_via_protect setting so the UI
+  // can pre-tick the right rows.  Reads the same config.json the config
+  // form writes to, so this stays in sync with the tickboxes.
+  std::set<std::string> via_protect_ips;
+  {
+    auto overrides = runtime_config::ReadFromFile(
+        ctx.config_path ? ctx.config_path : "");
+    auto vit = overrides.find("camera_snapshot_via_protect");
+    if (vit != overrides.end()) {
+      std::string s = vit->second;
+      size_t start = 0;
+      while (start <= s.size()) {
+        size_t comma = s.find(',', start);
+        std::string tok = s.substr(start,
+            comma == std::string::npos ? std::string::npos : comma - start);
+        // trim
+        while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t'))
+          tok.erase(tok.begin());
+        while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t'))
+          tok.pop_back();
+        if (!tok.empty()) via_protect_ips.insert(tok);
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+      }
+    }
+  }
   bool first = true;
   for (const auto& r : *rows_or) {
     if (!first) j += ',';
@@ -995,6 +1083,10 @@ std::string build_camera_health_json(const Ctx& ctx) {
       j += std::to_string(hit->second.pull_backoff_sec);
       j += ",\"pull_backoff_since_ms\":";
       j += std::to_string(hit->second.pull_backoff_since_ms);
+    }
+    if (r.is_third_party) {
+      j += ",\"snapshot_via_protect\":";
+      j += via_protect_ips.count(r.host) ? "true" : "false";
     }
     if (camera_needs_onvif_admin(r.host)) {
       j += ",\"hint\":\"needs_onvif_admin\"";

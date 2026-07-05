@@ -204,6 +204,17 @@ ABSL_FLAG(std::string, camera_snapshot_urls, "",
     "(common on Dahua, see issue #32).  The path is appended to "
     "http://<camera_ip>/ and authenticated with the camera's username "
     "and password from the Protect cameras table.");
+ABSL_FLAG(std::string, camera_snapshot_via_protect, "",
+    "Comma-separated list of camera IPs whose detection thumbnails "
+    "should be fetched via Protect's own /api/cameras/<id>/snapshot?"
+    "ts=<ms> endpoint instead of a direct HTTP GET against the "
+    "camera's snapshot URL.  Protect sources those from MSR (or the "
+    "live recording pipeline), so no additional concurrent HTTP "
+    "session is opened against the camera -- recommended for cameras "
+    "with strict concurrent-HTTP-session limits (many Amcrest / Dahua "
+    "firmwares) whose /snapshot endpoint sporadically 5xx's while RTSP "
+    "is active.  Requires --protect_url + Protect >= 7.1.0.  Falls "
+    "back to the direct HTTP path on failure.");
 ABSL_FLAG(std::string, rtsp_audio, "",
     "Set enableRtspAudio in the Protect database for all adopted third-party "
     "cameras that have audio capability (hasAudio=true). "
@@ -754,6 +765,14 @@ int main(int argc, char* argv[]) {
       [&](const std::string& ip, const std::string& v) {
         det_rec.set_camera_snapshot_url_path(ip, v);
       });
+  det_rec.set_protect_snapshot_source(absl::GetFlag(FLAGS_protect_url),
+                                       &protect_user_id_provider);
+  {
+    const std::string list = absl::GetFlag(FLAGS_camera_snapshot_via_protect);
+    for (const auto& ip : parse_csv(list)) {
+      if (!ip.empty()) det_rec.set_camera_snapshot_via_protect(ip);
+    }
+  }
 
   // Load NanoDet-M for thumbnail subject cropping, downloading if needed.
   std::unique_ptr<object_detect::ObjectDetector> detector;

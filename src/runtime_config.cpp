@@ -120,6 +120,13 @@ const std::vector<Entry>& Schema() {
      "e.g. 192.168.1.107=/cgi-bin/snapshot.cgi.  Useful when the "
      "ONVIF-advertised snapshotUrl is wrong (common on Dahua, issue #32).",
      "Cameras"},
+    {"camera_snapshot_via_protect", Type::String,
+     "Comma-separated list of camera IPs whose thumbnails should be "
+     "fetched via Protect's own snapshot API instead of a direct HTTP "
+     "GET against the camera.  Recommended for cameras with strict "
+     "concurrent-HTTP-session limits (many Amcrest / Dahua firmwares) "
+     "that sporadically 5xx while RTSP is streaming.",
+     "Cameras"},
 
     // ---- MSR forwarding ----
     {"msr_url", Type::String,
