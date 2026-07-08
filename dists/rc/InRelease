@@ -6,7 +6,7 @@ Label: onvif-recorder
 Suite: rc
 Codename: rc
 Version: 1.0
-Date: Wed, 08 Jul 2026 06:27:08 UTC
+Date: Wed, 08 Jul 2026 06:30:58 UTC
 Architectures: arm64
 Components: main
 Description: onvif-recorder release candidate channel
@@ -24,17 +24,17 @@ SHA256:
  d6cf60e53b85682434fe1229c7c7d1e1a0fc56612c04348ff228bad20cffef7c 160 main/binary-arm64/Release
 -----BEGIN PGP SIGNATURE-----
 
-iQIzBAEBCgAdFiEEppQhR+JB3iqGS85rXQujy8Eq0qIFAmpN7bwACgkQXQujy8Eq
-0qLQEg//UsmAhCSIZiDGA/9QxfHO6SoZ6Q9GL8F+XTo3COxCPFGakuIwjOT0aX7Z
-JQEKUKSe4qMZs40Ds+aeUAan5Gw7LwdZI1IaN1t4EyqX3g0gKGPZOWJIBvHX6PRl
-wyxEP1p5Yn28HcDswzkYx4WJAbU+xOUHzMlIeFLy2Ri21VY+86gYvyE9kfaY3w9X
-kS0NVGggErBafJwdaVaJEKcV+us2WSO3kw8575XzcksmAUhyj97Octi4eLL6T0si
-C8cke5frpa6MF1XzLZN1NxcDgSdmnuYaYOKGguUj8dKJReO8sBu3k1rnuV16gzG5
-8RpTfd70gI/C4hbCJELEdvELfTkzHB7htTvfQ7YNhWc/lt4G4XMNQxy7dtbowFgc
-GHPfVxPc95+octPEc7VZfeqq98yyig2ii8WU9K+yz3P1Fn4fANsXLwilPhNMES4H
-9TZXr3KnvucssTI0A3kjp1qge9bVs32Mioy4is6k9QMZjIqhxynHb4onokLUMPeA
-tjPN2+vdUMhnQThBXc06BsDvNJYkjqvjS9mebwKiSjYSIDyK6rZZolaJh3XzEKYM
-LQi6fqBQp//uckbC2f4+b/o+OQ25z2zTBAO7vFqTJRjTu61nWnU9r2+C8BO3lWWm
-kR+GI/mJcryJ72cSTP1FrMTitZ/ENLCKPWUuGZuXElEoUQJ06Ac=
-=iPau
+iQIzBAEBCgAdFiEEppQhR+JB3iqGS85rXQujy8Eq0qIFAmpN7qIACgkQXQujy8Eq
+0qLsTQ/8DuOqokziTDhQpCYpPxQ3VfpkboL6gzaFV4DdUR4wkjAH+35bUJs6YAeG
+CtxHE3zLvdGYLQrU1dID1K2SmAMXpH18WtLj1UezrzSLXa12SrzfNMiPBsylfSNc
+67XLhfO4ooMdidXwAlPsFAqd+kQTLOtlSVg2mSgA4Ke3k2ZQWOkme367EAcxYCVl
+CrHeDj1RPMVVaAGgPhhs1WMaW3/Vhd/PtXM00QM7SPlm4as7bbP/Qt5oR5N4qz3Z
+U0sdQga6+5kt0iR2Da+jwqPA4Am0IsiT5ftBcseWSNzMX/A61kYO1hWY9pqOJcdl
+Tg+74/0f09azn713+w0itJTcU7z0+fDnEjqx2gjOos9/Z5AjbJq/Rtai3CHqSkbv
+xGzV6XQbaV7SnADncIMb+hLU6varVujGlq8Ejb8+VvEO+xPQAdyLjPx11s4Z0QVk
+8yudSLXploDMNBMzwzj2sTRQNneY7amAdioY2PT5xH+GD3yT1EZfwnVWzqb3Ctjf
+ya0z6qaeC+ibnrPFVX+dOZ4myw9wELWBf9nxBmidMoIV7RUGrqQ4ShdFfgeG1LEV
++wecrV6df3sjGgtPQsxt+7ecSBxf778ZY/BCgX3/npOM5/IwhPNfDzr2IAlBboJE
+ugkx2KsVZFn3axbtE1pAbHSTz2QJD0zJhjFFQPX0iZviYZs/h34=
+=Cr7D
 -----END PGP SIGNATURE-----
