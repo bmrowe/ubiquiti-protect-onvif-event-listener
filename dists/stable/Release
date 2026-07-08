@@ -3,7 +3,7 @@ Label: onvif-recorder
 Suite: stable
 Codename: stable
 Version: 1.0
-Date: Wed, 08 Jul 2026 06:27:38 UTC
+Date: Wed, 08 Jul 2026 06:31:23 UTC
 Architectures: arm64
 Components: main
 Description: onvif-recorder stable channel
