@@ -31,23 +31,57 @@ namespace {
 
 // Query unifi-core's user_settings table for the owner's user_id.  No
 // cache.  Returns "" on any failure.
+//
+// Connects via TCP loopback rather than /run/postgresql because UniFi
+// OS 5.x tightened unifi-core's pg_hba.conf to `local all all peer`,
+// which rejects us (we run as root, not as the postgres OS user).  The
+// `host all all 127.0.0.1/32 trust` rule is present on every UniFi OS
+// variant we have data for and doesn't need any user-side change --
+// see issue #41's reporter notes.
+//
+// Query filters on notification_settings=custom.  On a single-user
+// system the previous `LIMIT 1` happened to return the owner, but on
+// multi-user installs it could return any user; a non-owner's user_id
+// hits /api/automations with a token that 401s, which then reappears
+// downstream as "automation triggers disabled" for a different reason.
+// Falling back to LIMIT-1 preserves the old behaviour if nobody has
+// notification_settings=custom for some reason.
 std::string query_user_id_from_unifi_core() {
   PGconn* conn = PQconnectdb(
-      "host=/run/postgresql port=5432 dbname=unifi-core user=postgres");
+      "host=127.0.0.1 port=5432 dbname=unifi-core user=postgres");
   if (PQstatus(conn) != CONNECTION_OK) {
     LOG(ERROR) << "[user_id] cannot query unifi-core DB: "
                << PQerrorMessage(conn);
     PQfinish(conn);
     return {};
   }
+  auto trim = [](std::string s) {
+    while (!s.empty() && s.back() == ' ') s.pop_back();
+    return s;
+  };
+  // Prefer the owner: notification_settings='custom' is the marker
+  // for the account provisioned during initial setup.  Field-verified
+  // on the dev router: the column is a USER-DEFINED enum, not JSONB,
+  // so direct string equality is the right comparison (no JSON quoting).
   PGresult* res = onvif::pg::ExecWithTimeout(conn, -1,
-      "SELECT user_id FROM user_settings LIMIT 1");
+      "SELECT user_id FROM user_settings "
+      "WHERE notification_settings = 'custom' LIMIT 1");
   std::string user_id;
   if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
-    user_id = PQgetvalue(res, 0, 0);
-    while (!user_id.empty() && user_id.back() == ' ') user_id.pop_back();
+    user_id = trim(PQgetvalue(res, 0, 0));
   }
   PQclear(res);
+  if (user_id.empty()) {
+    // Fallback for setups where nobody has notification_settings=custom
+    // (odd, but observed on some fresh installs before the owner has
+    // customised any notifications).  Same shape as the pre-#41 code.
+    res = onvif::pg::ExecWithTimeout(conn, -1,
+        "SELECT user_id FROM user_settings LIMIT 1");
+    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+      user_id = trim(PQgetvalue(res, 0, 0));
+    }
+    PQclear(res);
+  }
   PQfinish(conn);
   return user_id;
 }

@@ -1062,7 +1062,16 @@ int main(int argc, char* argv[]) {
     alarm_notifier->refresh_alarms();
     det_rec.set_alarm_notifier(alarm_notifier.get());
   } else {
-    LOG(INFO) << "[alarm] user ID not found; automation triggers disabled";
+    // WARNING (not INFO) because the failure mode is silent to the
+    // user: third-party detection events still record fine, but no
+    // automations / push notifications fire, and there's no other
+    // visible symptom.  Bumping the level makes it grep-able in
+    // journalctl without --verbose (issue #41).  Pair it with the
+    // reporter's manual override for setups where auto-discovery
+    // can't work.
+    LOG(WARNING) << "[alarm] user ID not found; automation triggers "
+                    "disabled (pass --protect_user_id=<UUID> to override; "
+                    "see issue #41)";
   }
   if (motion_poller && alarm_notifier)
     motion_poller->set_alarm_notifier(alarm_notifier.get());
