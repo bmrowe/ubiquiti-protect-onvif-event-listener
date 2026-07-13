@@ -197,6 +197,11 @@ absl::StatusOr<std::vector<onvif::CameraConfig>> load_cameras(
   if (!pg.ok())
     return absl::InternalError("unifi::load_cameras: " + pg.error());
 
+  // NOTE: we intentionally do NOT SELECT "isConnected" here.  It exists
+  // on some Protect versions and not others; the same warning fires
+  // for triagers via triage.json's read of cameras.json (build_
+  // cameras_json emits whatever columns the schema has).  Keeping the
+  // load query narrow means we don't need per-version fallbacks.
   const char* sql =
     "SELECT id, mac, host, \"thirdPartyCameraInfo\", COALESCE(type, ''), "
     "       COALESCE(channels::text, '[]'), "
@@ -215,6 +220,13 @@ absl::StatusOr<std::vector<onvif::CameraConfig>> load_cameras(
 
   std::vector<onvif::CameraConfig> cameras;
   int nrows = PQntuples(res);
+  auto is_blank_or_space = [](const std::string& s) {
+    for (char c : s) {
+      if (c != ' ' && c != '\t' && c != '\r' && c != '\n') return false;
+    }
+    return true;  // includes s.empty()
+  };
+
   for (int i = 0; i < nrows; ++i) {
     const char* id_c   = PQgetvalue(res, i, 0);
     const char* mac_c  = PQgetvalue(res, i, 1);
@@ -229,9 +241,41 @@ absl::StatusOr<std::vector<onvif::CameraConfig>> load_cameras(
     std::string username     = internal::json_get(info, "username");
     std::string password     = internal::json_get(info, "password");
     std::string snapshot_url = internal::json_get(info, "snapshotUrl");
+    std::string rtsp_url_lq  = internal::json_get(info, "rtspUrlLQ");
     std::string port         = internal::json_get(info, "port");
     std::string camera_type  = type_c ? std::string(type_c) : std::string();
+    const std::string host_str = host_c;
+
+    // Loud on the two silent-failure classes we've been diagnosing
+    // in-thread on issue #34:
+    //
+    //   * credentials stored as literal whitespace (Protect's broken-
+    //     adoption bug).  We were dropping these cameras silently at
+    //     the empty-check below; users then wondered why the camera
+    //     never appeared in the listener.  Now we log it explicitly.
+    //   * no substream URL captured.  Protect derives rtspUrlLQ from
+    //     the camera's own ONVIF GetProfiles at adoption time; a null
+    //     here typically means the camera advertises only a main
+    //     stream, which is the shape that produces "video not found"
+    //     / timeline stalls in Protect's playback pipeline.
+    if (is_blank_or_space(username) || is_blank_or_space(password)) {
+      LOG(WARNING) << "[unifi_camera_config] " << host_str
+                   << " (" << (camera_type.empty() ? "?" : camera_type)
+                   << "): credentials look empty/whitespace in Protect's "
+                      "thirdPartyCameraInfo -- re-adopt the camera in "
+                      "Protect (issue #34).  Skipping.";
+      continue;
+    }
     if (username.empty() || password.empty()) continue;
+    if (rtsp_url_lq.empty()) {
+      LOG(WARNING) << "[unifi_camera_config] " << host_str
+                   << " (" << (camera_type.empty() ? "?" : camera_type)
+                   << "): no substream captured (thirdPartyCameraInfo."
+                      "rtspUrlLQ is null).  Protect will likely struggle "
+                      "with playback for this camera.  If the camera "
+                      "supports a sub-stream, enable it in the camera's "
+                      "own settings and re-adopt.";
+    }
 
     std::string ip = host_c;
     if (!port.empty() && port != "80" && port != "0")

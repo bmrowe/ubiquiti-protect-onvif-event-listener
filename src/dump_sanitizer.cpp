@@ -219,6 +219,27 @@ std::string DumpSanitizer::sanitize(const std::string& in) {
   // in place.  Quoted values (double or single) still accept any char
   // inside the quotes, matching how JSON / INI / shell store secrets
   // that contain URL characters.
+  // For quoted values (JSON, Python-repr, INI) we replace with the
+  // SAME quote style so the enclosing document stays parseable --
+  // otherwise cameras.json becomes invalid JSON and downstream
+  // tooling that reads the dump silently drops the field.  Unquoted
+  // matches keep the bare [REDACTED] form.
+  auto redact_kv = [](const std::smatch& m) -> std::string {
+    const std::string key_sep = m[1].str();
+    const std::string value   = m[2].str();
+    // Preserve JSON null / true / false literals -- these are
+    // legitimate absent-value markers, not secrets to hide.  Leaving
+    // them in place also keeps downstream JSON parsers happy on
+    // cameras.json where thirdPartyCameraInfo often has
+    // "password": null for cameras that don't need credentials.
+    if (value == "null" || value == "true" || value == "false")
+      return m[0].str();
+    if (!value.empty()) {
+      if (value.front() == '"')  return key_sep + "\"[REDACTED]\"";
+      if (value.front() == '\'') return key_sep + "'[REDACTED]'";
+    }
+    return key_sep + "[REDACTED]";
+  };
   static const std::regex pw_kv_re(
       R"((\b(?:password|passwd|pwd)["']?\s*[=:]\s*))"
       R"(("[^"]*"|'[^']*'|[^\s,;&"'@/]+))",
@@ -226,7 +247,7 @@ std::string DumpSanitizer::sanitize(const std::string& in) {
   if (contains_any(out, {"password", "Password", "PASSWORD",
                           "passwd", "Passwd",
                           "pwd", "Pwd", "PWD"})) {
-    out = std::regex_replace(out, pw_kv_re, "$1[REDACTED]");
+    out = regex_replace_with(out, pw_kv_re, redact_kv);
   }
 
   static const std::regex user_kv_re(
@@ -234,7 +255,7 @@ std::string DumpSanitizer::sanitize(const std::string& in) {
       R"(("[^"]*"|'[^']*'|[^\s,;&"'@/]+))",
       std::regex::icase);
   if (contains_any(out, {"user", "User", "USER"})) {
-    out = std::regex_replace(out, user_kv_re, "$1[REDACTED]");
+    out = regex_replace_with(out, user_kv_re, redact_kv);
   }
 
   // -------- URL credentials: scheme://user:pass@host --------

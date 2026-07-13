@@ -354,6 +354,26 @@ long AlarmNotifier::perform_post(const std::string& url,  // NOLINT(runtime/int)
   return http_code;
 }
 
+// Categorise a non-2xx Protect API response so the log line names the
+// failure class rather than just the numeric code.  Each class points
+// at what the operator would actually do about it.  Used by both
+// http_get and http_post below (issue #41 follow-on).
+static const char* categorise_failure(long code) {  // NOLINT(runtime/int)
+  if (code == 401)
+    return "authentication failed (user_id token rejected -- pass "
+           "--protect_user_id=<UUID> to override, see issue #41)";
+  if (code == 403)
+    return "authorisation failed (this user_id lacks permission)";
+  if (code == 404)
+    return "not found (automation may have been deleted -- next refresh "
+           "will drop it)";
+  if (code == 429)
+    return "rate-limited by Protect API";
+  if (code >= 500)
+    return "Protect API server error (typically transient)";
+  return "unexpected status";
+}
+
 std::string AlarmNotifier::http_get(const std::string& url) {
   std::string body;
   long code = perform_get(url, user_id_provider_->current(), &body);  // NOLINT(runtime/int)
@@ -362,8 +382,10 @@ std::string AlarmNotifier::http_get(const std::string& url) {
     code = perform_get(url, user_id_provider_->current(), &body);  // NOLINT(runtime/int)
   }
   if (code != 200) {
-    if (code != 0)
-      LOG(ERROR) << "[alarm] GET " << url << " HTTP " << code;
+    if (code != 0) {
+      LOG(ERROR) << "[alarm] GET " << url << " HTTP " << code
+                 << " -- " << categorise_failure(code);
+    }
     body.clear();
   }
   return body;
@@ -377,7 +399,8 @@ void AlarmNotifier::http_post(const std::string& url, const std::string& body) {
   }
   if (code == 0) return;  // network error already logged
   if (code < 200 || code >= 300) {
-    LOG(ERROR) << "[alarm] POST " << url << " HTTP " << code;
+    LOG(ERROR) << "[alarm] POST " << url << " HTTP " << code
+               << " -- " << categorise_failure(code);
   } else {
     LOG(INFO) << "[alarm] POST " << url << " → " << code;
   }

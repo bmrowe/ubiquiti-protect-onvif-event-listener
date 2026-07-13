@@ -1445,6 +1445,126 @@ void collect_hashes(const std::string& text, const char* prefix,
 //
 // Consumes files already written to @p dump_dir, so it MUST run after
 // the captures at the end of build_diagnostic_dump().
+// Small string-scanning helpers for consuming the JSONB output that
+// build_cameras_json / build_recording_files_json produced earlier in
+// the dump.  We avoid pulling in a real JSON library because the
+// producer side is under our control and the shape is stable.
+
+// Iterate top-level `{...}` objects within a JSON array text, invoking
+// @p on_object with a view into each.  Handles nested braces + quoted
+// strings so nested objects (thirdPartyCameraInfo, ptz, etc.) don't
+// throw off the depth counter.
+static void for_each_top_level_object(std::string_view arr,
+    const std::function<void(std::string_view)>& on_object) {
+  size_t pos = 0;
+  while (pos < arr.size()) {
+    const size_t start = arr.find('{', pos);
+    if (start == std::string_view::npos) return;
+    int depth = 0;
+    size_t i = start;
+    while (i < arr.size()) {
+      const char c = arr[i];
+      if (c == '"') {
+        // Skip past the string, honouring backslash escapes.
+        ++i;
+        while (i < arr.size() && arr[i] != '"') {
+          if (arr[i] == '\\' && i + 1 < arr.size()) ++i;
+          ++i;
+        }
+      } else if (c == '{') {
+        ++depth;
+      } else if (c == '}') {
+        --depth;
+        if (depth == 0) {
+          on_object(arr.substr(start, i - start + 1));
+          pos = i + 1;
+          break;
+        }
+      }
+      ++i;
+    }
+    if (i >= arr.size()) return;
+  }
+}
+
+// Fetch `"key": "value"` from a JSON object view.  Returns empty when
+// the key is absent or its value is null / non-string.
+static std::string json_string_field(std::string_view obj, const char* key) {
+  const std::string needle = std::string("\"") + key + "\":";
+  const size_t p0 = obj.find(needle);
+  if (p0 == std::string_view::npos) return {};
+  size_t p = p0 + needle.size();
+  while (p < obj.size() && (obj[p] == ' ' || obj[p] == '\t')) ++p;
+  if (p >= obj.size()) return {};
+  if (obj[p] != '"') return {};
+  ++p;
+  const size_t q = obj.find('"', p);
+  if (q == std::string_view::npos) return {};
+  return std::string(obj.substr(p, q - p));
+}
+
+// Fetch `"key": <int>` from a JSON object view.  Returns 0 on absence.
+static int64_t json_int_field(std::string_view obj, const char* key) {
+  const std::string needle = std::string("\"") + key + "\":";
+  const size_t p0 = obj.find(needle);
+  if (p0 == std::string_view::npos) return 0;
+  size_t p = p0 + needle.size();
+  while (p < obj.size() && (obj[p] == ' ' || obj[p] == '\t')) ++p;
+  if (p >= obj.size()) return 0;
+  const int sign = (obj[p] == '-') ? (++p, -1) : 1;
+  int64_t v = 0;
+  bool any = false;
+  while (p < obj.size() && obj[p] >= '0' && obj[p] <= '9') {
+    v = v * 10 + (obj[p] - '0');
+    ++p; any = true;
+  }
+  return any ? v * sign : 0;
+}
+
+// Fetch `"key": true|false` from a JSON object view; @p dflt for
+// absence or non-boolean values.  null returns @p dflt.
+static bool json_bool_field(std::string_view obj, const char* key, bool dflt) {
+  const std::string needle = std::string("\"") + key + "\":";
+  const size_t p0 = obj.find(needle);
+  if (p0 == std::string_view::npos) return dflt;
+  size_t p = p0 + needle.size();
+  while (p < obj.size() && (obj[p] == ' ' || obj[p] == '\t')) ++p;
+  if (obj.substr(p, 4) == "true")  return true;
+  if (obj.substr(p, 5) == "false") return false;
+  return dflt;
+}
+
+// Fetch a nested `"key": {...}` sub-object as a string_view into @p obj.
+// Returns empty on absence or non-object value.
+static std::string_view json_object_field(
+    std::string_view obj, const char* key) {
+  const std::string needle = std::string("\"") + key + "\":";
+  const size_t p0 = obj.find(needle);
+  if (p0 == std::string_view::npos) return {};
+  size_t p = p0 + needle.size();
+  while (p < obj.size() && (obj[p] == ' ' || obj[p] == '\t')) ++p;
+  if (p >= obj.size() || obj[p] != '{') return {};
+  const size_t start = p;
+  int depth = 0;
+  while (p < obj.size()) {
+    const char c = obj[p];
+    if (c == '"') {
+      ++p;
+      while (p < obj.size() && obj[p] != '"') {
+        if (obj[p] == '\\' && p + 1 < obj.size()) ++p;
+        ++p;
+      }
+    } else if (c == '{') {
+      ++depth;
+    } else if (c == '}') {
+      --depth;
+      if (depth == 0) return obj.substr(start, p - start + 1);
+    }
+    ++p;
+  }
+  return {};
+}
+
 std::string build_triage_json(const std::string& dump_dir) {
   const auto read = [&dump_dir](const char* name) -> std::string {
     std::ifstream f(dump_dir + "/" + name, std::ios::binary);
@@ -1456,54 +1576,92 @@ std::string build_triage_json(const std::string& dump_dir) {
   const std::string api      = read("protect-api.log");
   const std::string grpc     = read("protect-grpc-client.log");
   const std::string addon    = read("protect-addon.log");
-  const std::string journal  = read("journal.log");
   const std::string cameras  = read("cameras.json");
   const std::string rec      = read("recording_files.json");
 
-  // Only enumerate hashed identifiers that appear in cameras.json.
-  // The 24-hex Mongo-ID + MAC redactions fire on every matching token
-  // in the dump -- notification IDs, session IDs, user IDs, etc. --
-  // so if we walked the union across all files we'd emit hundreds of
-  // zero-count rows for unrelated IDs.  cameras.json is the ground
-  // truth for "which id/mac is a camera on this device."
-  std::set<std::string> ids, macs;
-  collect_hashes(cameras, "id-",  &ids);
-  collect_hashes(cameras, "mac-", &macs);
-
-  // Score every key, then emit sorted by total error weight desc so the
-  // culprit camera surfaces on the first row without scrolling.
+  // Per-camera row.  Consolidates the id- and mac- hashes of a single
+  // camera into one entry (they used to be emitted separately, which
+  // meant every camera occupied two rows in the output and doubled the
+  // work triagers had to do), and carries enough metadata to attach a
+  // human-readable hint on the failure mode.
   struct Row {
-    std::string key;
-    bool is_mac{false};
-    int snap_err{0};
-    int lost_rec{0};
-    int list_frag{0};
+    std::string id_key;         // "id-<8hex>" -- may be empty
+    std::string mac_key;        // "mac-<8hex>" -- may be empty
+    std::string name;           // "Camera-<8hex>"
+    std::string type;           // "Reolink", "Amcrest", ...
+    std::string host;           // sanitised host
+    bool        is_third_party = false;
+    bool        is_connected   = true;
+    bool        has_substream  = true;
+    bool        creds_blank    = false;
+    // Recording file coverage from recording_files.json (0 if absent).
+    int64_t     rec_count_1h   = 0;
+    int64_t     rec_count_24h  = 0;
+    int64_t     rec_count_total = 0;
+    // Cross-referenced error counters (both hashes contribute).
+    int         snap_err  = 0;
+    int         lost_rec  = 0;
+    int         list_frag = 0;
     int score() const { return snap_err + lost_rec + list_frag; }
   };
   std::vector<Row> rows;
-  rows.reserve(ids.size() + macs.size());
-  for (const auto& id : ids) {
-    Row r; r.key = id;  r.is_mac = false; rows.push_back(std::move(r));
-  }
-  for (const auto& mac : macs) {
-    Row r; r.key = mac; r.is_mac = true;  rows.push_back(std::move(r));
-  }
-  // Index rows by key AFTER all pushes so the pointers stay valid even
-  // if the reserve above ever gets out of sync with the actual push
-  // count.  string_view keys point into rows[].key.data() -- stable so
-  // long as rows[] isn't grown further, which we no longer do.
-  std::unordered_map<std::string_view, Row*> row_by_key;
-  row_by_key.reserve(rows.size());
-  for (auto& r : rows) row_by_key[r.key] = &r;
 
-  // Cross-reference each source-file / needle in ONE pass per file,
-  // instead of the previous O(cameras * files * bytes) approach.  Prior
-  // implementation was substr-per-line + N find() calls per line for
-  // each (camera, needle) tuple; on a 21-camera install with a few MB
-  // of api.log that dominated dump generation and drove the CPU peg
-  // reports on 1.6.12.  Now each file is walked line-by-line via
-  // string_view (no allocations) and per-line we only iterate the row
-  // map when the needle actually hit the line.
+  // Parse cameras.json -> one Row per camera.
+  for_each_top_level_object(cameras, [&](std::string_view obj) {
+    Row r;
+    r.id_key         = json_string_field(obj, "id");
+    r.mac_key        = json_string_field(obj, "mac");
+    r.name           = json_string_field(obj, "name");
+    r.type           = json_string_field(obj, "type");
+    r.host           = json_string_field(obj, "host");
+    r.is_third_party = json_bool_field(obj, "isThirdPartyCamera", false);
+    r.is_connected   = json_bool_field(obj, "isConnected", true);
+    // thirdPartyCameraInfo shape check: rtspUrlLQ null means Protect has
+    // only a main-stream URL for this camera; credentials of literal " "
+    // are the broken-adoption marker (issue #34 gleep52-style).
+    if (r.is_third_party) {
+      const auto tpi = json_object_field(obj, "thirdPartyCameraInfo");
+      if (!tpi.empty()) {
+        r.has_substream = !json_string_field(tpi, "rtspUrlLQ").empty();
+        const std::string u = json_string_field(tpi, "username");
+        const std::string p = json_string_field(tpi, "password");
+        auto blank = [](const std::string& s) {
+          for (char c : s) if (c != ' ' && c != '\t') return false;
+          return true;
+        };
+        r.creds_blank = blank(u) || blank(p);
+      }
+    }
+    rows.push_back(std::move(r));
+  });
+
+  // Layer recording_files.json onto the rows keyed by cameraId (id_key).
+  {
+    std::unordered_map<std::string, Row*> by_id;
+    by_id.reserve(rows.size());
+    for (auto& r : rows) if (!r.id_key.empty()) by_id[r.id_key] = &r;
+    for_each_top_level_object(rec, [&](std::string_view obj) {
+      const std::string cam = json_string_field(obj, "cameraId");
+      auto it = by_id.find(cam);
+      if (it == by_id.end()) return;
+      it->second->rec_count_1h    = json_int_field(obj, "count_1h");
+      it->second->rec_count_24h   = json_int_field(obj, "count_24h");
+      it->second->rec_count_total = json_int_field(obj, "count_total");
+    });
+  }
+
+  // Index every non-empty key (id + mac) to its owning row so a single
+  // log-file scan can increment the right counter for either identifier.
+  std::unordered_map<std::string_view, Row*> row_by_key;
+  row_by_key.reserve(rows.size() * 2);
+  for (auto& r : rows) {
+    if (!r.id_key.empty())  row_by_key[r.id_key]  = &r;
+    if (!r.mac_key.empty()) row_by_key[r.mac_key] = &r;
+  }
+
+  // Cross-reference each source-file / needle in ONE pass per file.
+  // Per-line: cheap needle check first; only iterate the row map when
+  // the needle actually matches.
   auto scan_file =
       [&row_by_key](const std::string& haystack,
                     std::string_view needle,
@@ -1511,7 +1669,7 @@ std::string build_triage_json(const std::string& dump_dir) {
     if (haystack.empty() || needle.empty()) return;
     size_t line_start = 0;
     while (line_start < haystack.size()) {
-      size_t nl = haystack.find('\n', line_start);
+      const size_t nl = haystack.find('\n', line_start);
       const size_t line_end =
           (nl == std::string::npos) ? haystack.size() : nl;
       const std::string_view line(haystack.data() + line_start,
@@ -1530,34 +1688,79 @@ std::string build_triage_json(const std::string& dump_dir) {
   scan_file(api,   "Snapshot not available",       &Row::snap_err);
   scan_file(grpc,  "Lost recording notification",  &Row::lost_rec);
   scan_file(addon, "ListFragments",                &Row::list_frag);
-  // list_frag is only meaningful for MAC-typed rows (UBV paths use the
-  // camera's MAC); zero out any id-typed hits so the schema stays clean.
-  for (auto& r : rows) if (!r.is_mac) r.list_frag = 0;
-  std::sort(rows.begin(), rows.end(),
-            [](const Row& a, const Row& b) {
-              if (a.score() != b.score()) return a.score() > b.score();
-              return a.key < b.key;  // stable-ish tiebreak
-            });
+
+  // Compute a per-row hint capturing the most likely diagnosis.  Order
+  // matters: pick the strongest signal first so triagers see a single
+  // clear message rather than a shopping list.
+  auto compute_hint = [](const Row& r) -> std::string {
+    // Credentials are sanitised in cameras.json (username/password
+    // replaced with "[REDACTED]"), so we can't reliably detect the
+    // literal-whitespace-creds case from the dump.  That signal is
+    // instead surfaced at service start by unifi_camera_config
+    // (see WARNING lines in journal.log).
+    if (r.is_third_party) {
+      if (!r.is_connected)
+        return "Protect reports the camera as disconnected "
+               "(cameras.isConnected=false)";
+      if (r.snap_err > 0 && r.rec_count_24h == 0)
+        return "Protect isn't recording this camera (0 recordingFiles "
+               "in the last 24h) -- check RTSP adoption / substream";
+      if (!r.has_substream)
+        return "no substream (thirdPartyCameraInfo.rtspUrlLQ is null); "
+               "Protect struggles with playback for this shape";
+      if (r.lost_rec > 0)
+        return "MSR is dropping recording segments for this camera "
+               "(Lost recording notification hits) -- typically an "
+               "unstable RTSP stream";
+    }
+    if (r.snap_err > 0 && r.score() == r.snap_err)
+      return "camera has snapshot-fetch failures (may be an intermittent "
+             "concurrent-HTTP-session limit on the camera side)";
+    return {};
+  };
+
+  // Emit: third-party rows first (they're what #34-shaped reports are
+  // usually about), then by score desc, then by name for stable output.
+  std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
+    if (a.is_third_party != b.is_third_party)
+      return a.is_third_party;  // third-party first
+    if (a.score() != b.score()) return a.score() > b.score();
+    return a.name < b.name;
+  });
 
   std::string j = "{\"per_camera\":[";
   bool first = true;
   for (const Row& r : rows) {
     if (!first) j += ',';
     first = false;
-    j += "{\"key\":\"";
-    j += r.key;
-    j += "\",\"kind\":\"";
-    j += r.is_mac ? "mac" : "id";
-    j += "\",\"snapshot_errors\":" + std::to_string(r.snap_err);
-    j += ",\"lost_recording_notifications\":"
-         + std::to_string(r.lost_rec);
-    if (r.is_mac) {
-      j += ",\"list_fragments_lines\":" + std::to_string(r.list_frag);
+    j += "{\"name\":\"";     j += r.name;
+    j += "\",\"type\":\"";   j += r.type;
+    j += "\",\"host\":\"";   j += r.host;
+    j += "\",\"is_third_party\":";
+    j += r.is_third_party ? "true" : "false";
+    if (!r.id_key.empty())  { j += ",\"id\":\"";  j += r.id_key;  j += "\""; }
+    if (!r.mac_key.empty()) { j += ",\"mac\":\""; j += r.mac_key; j += "\""; }
+    j += ",\"snapshot_errors\":";
+    j += std::to_string(r.snap_err);
+    j += ",\"lost_recording_notifications\":";
+    j += std::to_string(r.lost_rec);
+    j += ",\"list_fragments_lines\":";
+    j += std::to_string(r.list_frag);
+    j += ",\"recording_files_24h\":";
+    j += std::to_string(r.rec_count_24h);
+    const std::string hint = compute_hint(r);
+    if (!hint.empty()) {
+      j += ",\"hint\":\"";
+      j += hint;
+      j += "\"";
     }
     j += "}";
   }
   j += "],";
-  // Global totals -- handy top-of-file summary.
+  // Global totals -- handy top-of-file summary + phantom detection.
+  std::set<std::string> ids_seen, macs_seen;
+  collect_hashes(cameras, "id-",  &ids_seen);
+  collect_hashes(cameras, "mac-", &macs_seen);
   j += "\"totals\":{";
   j += "\"snapshot_errors\":" +
        std::to_string(count_occurrences(api, "Snapshot not available"));
@@ -1566,8 +1769,9 @@ std::string build_triage_json(const std::string& dump_dir) {
            "Lost recording notification"));
   j += ",\"list_fragments_lines\":" +
        std::to_string(count_occurrences(addon, "ListFragments"));
-  j += ",\"distinct_ids_seen\":"  + std::to_string(ids.size());
-  j += ",\"distinct_macs_seen\":" + std::to_string(macs.size());
+  j += ",\"cameras_in_dump\":"     + std::to_string(rows.size());
+  j += ",\"distinct_ids_seen\":"   + std::to_string(ids_seen.size());
+  j += ",\"distinct_macs_seen\":"  + std::to_string(macs_seen.size());
   j += "}}";
   return j;
 }
