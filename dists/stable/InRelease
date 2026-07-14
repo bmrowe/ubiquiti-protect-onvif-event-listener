@@ -6,7 +6,7 @@ Label: onvif-recorder
 Suite: stable
 Codename: stable
 Version: 1.0
-Date: Wed, 08 Jul 2026 06:44:44 UTC
+Date: Tue, 14 Jul 2026 07:11:44 UTC
 Architectures: arm64
 Components: main
 Description: onvif-recorder stable channel
@@ -24,17 +24,17 @@ SHA256:
  b44ba30daf8e3d33127ee15a9ce8185a34461185153db4211fd70824bee58d19 153 main/binary-arm64/Release
 -----BEGIN PGP SIGNATURE-----
 
-iQIzBAEBCgAdFiEEppQhR+JB3iqGS85rXQujy8Eq0qIFAmpN8dwACgkQXQujy8Eq
-0qJO3g/8D/Mazn3qC/ZpOW9DFlPVFSv6zTAAyS5o3q86m5BGad7FlgddteNgdMz8
-qpB7QGC8KZwV9dOCiP0hhgrz9rjTHvwaTeeZBIMCArE/YDU6+7osflwiw3hdFZ9p
-aWfG/iB4/Am3V6zOdxzUTWmwwOVHWzzD/VZdE234GIs0MSppZm0CxqK56NLvxBZ1
-jupWo489zIJYp5qVzPXbG7GVa/f2anNKXJzP3Xlu+pqRnOxRyOW5L5kuR0pemlKD
-/mM7ZUxKEUy/MVFEYy2d8SpR3USqkzrQASOZE1poabKBSTjkjMld72Xw9DMSfail
-cZdf/HArurHOYpF4FKXekmsIr7gmpu6U1HW93GTSZIyTE/rOsf6W/30jrYHfXGLW
-LcomuNfBnZlo71hwbyAKGpKm6IbecViebvUaQJ98Ap+jYd0B6Cu/Zv2++axYNuE1
-p6v00SjI+wBJ+ZTN5eUM82jawyqZ8nek5cTI+7IVLI13ep5ylWVxlN9qMBCf7NHf
-sjlnYCW57XWgBv3lBWkKrSVwFat8HvIceXKprtBqvL8lP2WSggXGB7Zrmrk2R+r9
-hZKJsduGpdwd50QjbnLBX1gLZMDMjzzNlgoPESh5qjm3Y7Plw1CWAWQst7vxOb8X
-5IC8eibb/i2eFupDoALm40cxLSDgH2lvplzItLa3r8ayo8jrCuQ=
-=H08a
+iQIzBAEBCgAdFiEEppQhR+JB3iqGS85rXQujy8Eq0qIFAmpV4TAACgkQXQujy8Eq
+0qJWhg//QHhW1Y+g9xpYeBXkQ1hmP1ue25wmT4xcDCSa0BhK7pC02rxDPzNqs+84
+OyV9mHDIziubJ6uaSohOtfhvv6cfNBJzhx1CkkiQuDXAEeph7aVfjsD3BT92Q84H
+xIF4B8PZFZaGDZZRS2BkC4EgXaD/9WodXkmAfoxX6albYDt4zTt5kM1R0Wid//wQ
+ayvXvNbHsVMo57NQfCj8b/DGtIJW6/wMnZKzs5zTOTj489qs3MCTxafFudldheIH
+exs5b3502me77YagX+Nl0oJv1ykvXVXwhBdH9CVMadTzlT+SoX+l1bevuum3yxe9
+fCssp+McQTl2f76LPjXoTdylT/X1n54TdIX1EFoKKxKNZzQPAGGQVNnunjUSRXFK
+nnhg5Vdz+JWRoHcluscWTzjwX4VZJsvmaUWxxmfPEgRPcQTbhuZl5eRTW5IwNTqH
+KJayOb3VnknoX/ENyPowbWR4/pq0JTkc72+8MkqUqODBWB2e8crGzQrZJAxHXq9b
+XkL4FE4QPvY3NzoshIyxxIEVfhDIWrKlLfSIV7+HhFwRzQNgOcBuan2iRRlDwpz5
+eNxeBit+yFiBDipcMyuxP1UXw3SIFzWiWBFY+kFlp8of24ApyhNyKC2blZjuKj/z
+ONl4Czb3Z73fqghyAvCVvhvcDAl1N4YlEXq/Zh8MYU2juVVIo/o=
+=BHHz
 -----END PGP SIGNATURE-----
