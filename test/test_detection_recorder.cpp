@@ -296,6 +296,36 @@ static std::string make_human_shape_response(bool state, const std::string& utc_
     "</s:Envelope>";
 }
 
+// Reolink pet detection: tns1:RuleEngine/MyRuleDetector/DogCatDetect
+static std::string make_dogcat_response(bool state, const std::string& utc_time) {
+  const std::string val = state ? "true" : "false";
+  return
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+    "<s:Envelope"
+    " xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\""
+    " xmlns:wsnt=\"http://docs.oasis-open.org/wsn/b-2\""
+    " xmlns:tev=\"http://www.onvif.org/ver10/events/wsdl\""
+    " xmlns:tt=\"http://www.onvif.org/ver10/schema\">"
+    "<s:Body>"
+    "<tev:PullMessagesResponse>"
+    "<wsnt:NotificationMessage>"
+    "<wsnt:Topic>tns1:RuleEngine/MyRuleDetector/DogCatDetect</wsnt:Topic>"
+    "<wsnt:Message>"
+    "<tt:Message UtcTime=\"" + utc_time + "\" PropertyOperation=\"Changed\">"
+    "<tt:Source>"
+    "<tt:SimpleItem Name=\"VideoSourceConfigurationToken\" Value=\"VideoSourceMain\"/>"
+    "</tt:Source>"
+    "<tt:Data>"
+    "<tt:SimpleItem Name=\"State\" Value=\"" + val + "\"/>"
+    "</tt:Data>"
+    "</tt:Message>"
+    "</wsnt:Message>"
+    "</wsnt:NotificationMessage>"
+    "</tev:PullMessagesResponse>"
+    "</s:Body>"
+    "</s:Envelope>";
+}
+
 // ============================================================
 // SnapshotSyntheticEmulator
 //
@@ -2686,6 +2716,110 @@ static void test_version_gate_rich_path_on_7_1() {
   onvif::protect_version::ResetForTesting();
 }
 
+// ============================================================
+// Reolink pet (DogCatDetect) classification test
+// ============================================================
+static void test_dogcat_classification(const std::string& ubv_dir) {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("DetectionRecorder::CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_ubv_dir(ubv_dir);
+
+  auto jpeg = load_file(source_dir() + "testdata/snapshot_108.jpg");
+  SnapshotSyntheticEmulator emu("192.168.1.210",
+    {make_dogcat_response(true,  "2026-03-23T10:00:00Z"),
+     make_dogcat_response(false, "2026-03-23T10:00:05Z")},
+    jpeg);
+  emu.start();
+
+  bool ok = run_single_camera(emu, recorder, 2);
+  CHECK(ok, "dogcat_classification: timed out");
+
+  int events = static_cast<int>(bptr->events.size());
+  CHECK(events == 1,
+        "dogcat_classification: expected 1 detection, got "
+        + std::to_string(events));
+
+  int animal_sdo = 0;
+  for (auto& s : bptr->sdos) if (s.obj_type == "animal") ++animal_sdo;
+  CHECK(animal_sdo == 1,
+        "dogcat_classification: expected 1 animal SDO, got "
+        + std::to_string(animal_sdo));
+}
+
+// ============================================================
+// --drop_unclassified_motion test
+//
+// With the flag on and no detector loaded, generic motion (which NanoDet-M
+// cannot classify) is dropped rather than recorded as default_object_type;
+// a real camera AI event is still recorded.
+// ============================================================
+static void test_drop_unclassified_motion(const std::string& ubv_dir) {
+  // Part 1: generic motion is dropped.
+  {
+    auto backend = std::make_unique<MockBackend>();
+    MockBackend* bptr = backend.get();
+    auto rec_or =
+        onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+    CHECK(rec_or.ok(), "drop_unclassified: CreateWithBackend failed");
+    onvif::DetectionRecorder& recorder = **rec_or;
+    recorder.set_ubv_dir(ubv_dir);
+    recorder.set_drop_unclassified_motion(true);
+
+    auto jpeg = load_file(source_dir() + "testdata/snapshot_108.jpg");
+    SnapshotSyntheticEmulator emu("192.168.1.211",
+      {make_cell_motion_response(true,  "2026-03-24T10:00:00Z"),
+       make_cell_motion_response(false, "2026-03-24T10:00:05Z")},
+      jpeg);
+    emu.start();
+
+    bool ok = run_single_camera(emu, recorder, 2);
+    CHECK(ok, "drop_unclassified: timed out (motion)");
+    int events = static_cast<int>(bptr->events.size());
+    CHECK(events == 0,
+          "drop_unclassified: expected 0 events for unclassified motion, got "
+          + std::to_string(events));
+  }
+
+  // Part 2: a real AI event (human -> person) is still recorded.
+  {
+    auto backend = std::make_unique<MockBackend>();
+    MockBackend* bptr = backend.get();
+    auto rec_or =
+        onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+    CHECK(rec_or.ok(), "drop_unclassified: CreateWithBackend failed (ai)");
+    onvif::DetectionRecorder& recorder = **rec_or;
+    recorder.set_ubv_dir(ubv_dir);
+    recorder.set_drop_unclassified_motion(true);
+
+    auto jpeg = load_file(source_dir() + "testdata/snapshot_108.jpg");
+    SnapshotSyntheticEmulator emu("192.168.1.212",
+      {make_human_shape_response(true,  "2026-03-24T10:01:00Z"),
+       make_human_shape_response(false, "2026-03-24T10:01:05Z")},
+      jpeg);
+    emu.start();
+
+    bool ok = run_single_camera(emu, recorder, 2);
+    CHECK(ok, "drop_unclassified: timed out (ai)");
+    int events = static_cast<int>(bptr->events.size());
+    CHECK(events == 1,
+          "drop_unclassified: expected AI event recorded, got "
+          + std::to_string(events));
+    int person_sdo = 0;
+    for (auto& s : bptr->sdos) if (s.obj_type == "person") ++person_sdo;
+    CHECK(person_sdo == 1,
+          "drop_unclassified: expected 1 person SDO, got "
+          + std::to_string(person_sdo));
+  }
+}
+
 int main() {
   const std::string ubv_dir = "/tmp/test_dr_thumbs";
 
@@ -2697,6 +2831,10 @@ int main() {
            [&] { test_cell_motion_classification(ubv_dir); });
   run_test("motion_alarm_fallback",
            [&] { test_motion_alarm_fallback(ubv_dir); });
+  run_test("dogcat_classification",
+           [&] { test_dogcat_classification(ubv_dir); });
+  run_test("drop_unclassified_motion",
+           [&] { test_drop_unclassified_motion(ubv_dir); });
   run_test("cell_motion_suppresses_alarm",
            [&] { test_cell_motion_suppresses_alarm(ubv_dir); });
   run_test("ai_suppresses_cell_motion",

@@ -63,6 +63,9 @@ class MsrClient;      // forward declaration; full definition in msr_client.hpp
  *   tns1:RuleEngine/MyRuleDetector/VehicleDetect  (Reolink)
  *     data["State"]    = "true"  | "false"   (maps to "vehicle")
  *
+ *   tns1:RuleEngine/MyRuleDetector/DogCatDetect  (Reolink "pet")
+ *     data["State"]    = "true"  | "false"   (maps to "animal")
+ *
  * Basic motion events (suppressed when camera emits AI events):
  *   tns1:RuleEngine/CellMotionDetector/Motion  (Amcrest, Lorex, UNVR etc.)
  *     data["IsMotion"] = "true"  | "false"   (maps to "person")
@@ -242,6 +245,13 @@ class DetectionRecorder {
   /// When override is true the detector is always run, ignoring any ONVIF
   /// bounding box provided by the camera. Has no effect if no detector is set.
   void set_detect_override(bool override);
+
+  /// When true, generic motion events (CellMotionDetector / MotionAlarm) that
+  /// carry no ONVIF object class and that NanoDet-M cannot classify are
+  /// dropped instead of being recorded as the default_object_type.  Real AI
+  /// events (Person / Vehicle / Pet) and per-camera overrides are unaffected.
+  /// Default false (preserves prior behaviour: record as default_object_type).
+  void set_drop_unclassified_motion(bool drop);
 
   /// When enabled, thumbnail IDs use the MSR "{MAC}-{timestamp_ms}" format
   /// (length != 24) matching the native Protect convention, instead of the
@@ -518,6 +528,10 @@ class DetectionRecorder {
 
   // When true the detector is preferred over ONVIF-provided bounding boxes.
   bool detect_override_{false};
+
+  // When true, drop generic-motion events that NanoDet-M cannot classify
+  // instead of recording them as default_object_type_.  Default false.
+  bool drop_unclassified_motion_{false};
 
   // When true, thumbnail IDs use the MSR "{MAC}-{ts_ms}" format (len != 24).
   bool use_msr_thumb_ids_{false};
