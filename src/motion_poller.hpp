@@ -131,6 +131,19 @@ class MotionPoller {
   /// Interval in seconds between poll cycles.  Default: 10.
   void set_poll_interval(int sec);
 
+  /// When @p enabled (default true), the poller installs a Postgres AFTER
+  /// INSERT trigger on the `events` table that fires
+  /// `pg_notify('onvif_recorder_motion', NEW.id)` for `type='motion'` rows,
+  /// and switches from a fixed poll_interval sleep to a socket wait that
+  /// wakes on the first NOTIFY.  This drops steady-state DB query rate
+  /// from (cameras x poll_cycles/min) to roughly the motion event rate.
+  /// A slow fallback poll still runs on a 60-second safety-net timeout so
+  /// notifications lost mid-flight don't cause missed events.
+  /// If the trigger install fails (e.g. Protect's DB doesn't yet have the
+  /// `events` table on a fresh install), the poller falls back to the
+  /// classic interval-based poll for that run.
+  void set_push_mode(bool enabled);
+
   /// On startup, pull the high-water mark back to (now - @p days) so the
   /// next poll cycles re-scan the last N days of motion events and
   /// re-classify any that didn't produce a smartDetectZone last time

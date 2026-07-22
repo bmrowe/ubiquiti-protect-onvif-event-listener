@@ -38,6 +38,7 @@
 #include "event_enricher.hpp"
 #include "pg_util.hpp"
 #include "protect_version.hpp"
+#include "util.hpp"
 
 namespace onvif {
 namespace event_recovery {
@@ -261,6 +262,13 @@ absl::Status EnrichRestored(PGconn* conn, EnrichOptions opts) {
   // SELECT's WHERE clause naturally excludes rows we've already
   // enriched, so no explicit cursor is needed -- each iteration just
   // re-runs the query and picks up the next chunk of remaining work.
+  // Time-bounded to the last 30 days: without the floor this scanned
+  // the entire events table on every batch (evaluating
+  // jsonb_path_exists + a correlated NOT EXISTS per row), which
+  // repeatedly timed out on issue #34's gleep52 dump (6 s budget).  30
+  // days is longer than any restore window we ship or expect users to
+  // hit, and events older than that predate the enrichment machinery
+  // being useful.
   const char* select_events =
       "SELECT e.id, e.\"cameraId\", e.type, "
       "       e.\"smartDetectTypes\"::text, "
@@ -269,6 +277,7 @@ absl::Status EnrichRestored(PGconn* conn, EnrichOptions opts) {
       "       COALESCE(e.\"thumbnailId\", '') "
       "FROM events e "
       "WHERE e.\"cameraId\" IS NOT NULL "
+      "  AND e.start > $2::bigint "
       "  AND ( "
       "    e.metadata IS NULL "
       "    OR NOT jsonb_path_exists(e.metadata::jsonb, '$.detectedAreas') "
@@ -308,7 +317,10 @@ absl::Status EnrichRestored(PGconn* conn, EnrichOptions opts) {
     const auto batch_start = std::chrono::steady_clock::now();
 
     const std::string limit_str = std::to_string(batch_size);
-    const char* select_params[] = { limit_str.c_str() };
+    const uint64_t floor_ms =
+        util::now_ms() - 30ULL * 86'400'000ULL;
+    const std::string floor_str = std::to_string(floor_ms);
+    const char* select_params[] = { limit_str.c_str(), floor_str.c_str() };
     // Explicit per-query timeout: 3x the batch target gives generous
     // headroom over expected duration but still fails fast if the DB
     // is wedged.  Passing an explicit value here bypasses the pg_util
@@ -316,7 +328,7 @@ absl::Status EnrichRestored(PGconn* conn, EnrichOptions opts) {
     const int select_timeout_ms =
         static_cast<int>(opts.target_batch_ms.count()) * 3;
     PGresult* r = onvif::pg::ExecParamsWithTimeout(
-        conn, select_timeout_ms, select_events, 1,
+        conn, select_timeout_ms, select_events, 2,
         nullptr, select_params, nullptr, nullptr, 0);
     if (PQresultStatus(r) != PGRES_TUPLES_OK) {
       auto msg = std::string("[recovery] select events failed: ")

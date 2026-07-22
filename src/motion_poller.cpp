@@ -16,6 +16,7 @@
 
 #include <curl/curl.h>
 #include <libpq-fe.h>
+#include <sys/select.h>
 
 #include <algorithm>
 #include <chrono>
@@ -26,6 +27,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -42,6 +44,127 @@
 #include "util.hpp"
 
 namespace onvif {
+
+namespace {
+
+// LISTEN/NOTIFY channel that the events-INSERT trigger publishes to.
+// The trigger is idempotent (CREATE OR REPLACE + DROP IF EXISTS) so the
+// motion poller can reinstall it on every start without side effects.
+constexpr const char* kMotionChannel = "onvif_recorder_motion";
+
+constexpr const char* kMotionTriggerFnSql = R"(
+CREATE OR REPLACE FUNCTION onvif_recorder_motion_notify()
+  RETURNS TRIGGER
+  LANGUAGE plpgsql
+  AS $body$
+BEGIN
+  IF NEW.type = 'motion' THEN
+    PERFORM pg_notify('onvif_recorder_motion', NEW.id);
+  END IF;
+  RETURN NULL;
+END;
+$body$;
+)";
+
+constexpr const char* kMotionTriggerDropSql = "DROP TRIGGER IF EXISTS onvif_recorder_motion ON events";  // NOLINT(whitespace/line_length)
+
+constexpr const char* kMotionTriggerCreateSql = R"(
+CREATE TRIGGER onvif_recorder_motion
+  AFTER INSERT ON events
+  FOR EACH ROW
+  EXECUTE FUNCTION onvif_recorder_motion_notify();
+)";
+
+// Safety-net poll timeout when running in push mode.  If NOTIFY drops on
+// the floor (Postgres does not queue notifications for disconnected
+// listeners), the socket wait falls through after this many milliseconds
+// and forces one poll cycle regardless.
+constexpr int kSafetyNetTimeoutMs = 60'000;
+
+// Install the events-INSERT trigger + LISTEN on @p conn.  Returns true on
+// success; on failure logs a warning and returns false so the caller can
+// fall back to the classic interval poll.  Idempotent -- calling twice
+// simply refreshes the trigger.
+bool try_install_motion_trigger_and_listen(PGconn* conn) {
+  auto run = [conn](const char* sql, const char* label) -> bool {
+    PGresult* r = onvif::pg::ExecWithTimeout(conn, -1, sql);
+    if (PQresultStatus(r) != PGRES_COMMAND_OK) {
+      LOG(WARNING) << "[motion_poller] " << label << ": "
+                   << PQresultErrorMessage(r)
+                   << " -- falling back to interval poll";
+      PQclear(r);
+      return false;
+    }
+    PQclear(r);
+    return true;
+  };
+  if (!run(kMotionTriggerFnSql,     "trigger function"))    return false;
+  if (!run(kMotionTriggerDropSql,   "trigger drop"))        return false;
+  if (!run(kMotionTriggerCreateSql, "trigger create"))      return false;
+  if (!run("LISTEN onvif_recorder_motion", "LISTEN"))       return false;
+  LOG(INFO) << "[motion_poller] push mode active: LISTEN "
+            << kMotionChannel;
+  return true;
+}
+
+// Wait for either a NOTIFY on the connection socket or @p timeout_ms
+// elapsing, whichever comes first.  Returns quickly on stop() by polling
+// the running flag in 1-second slices.  Notifications are drained
+// (their id payloads are not needed -- the subsequent poll query is
+// hwm-driven and picks up whatever landed).
+void wait_for_notify_or_timeout(PGconn* conn,
+                                 int timeout_ms,
+                                 const std::atomic<bool>& running) {
+  // libpq's query machinery drains the socket internally, so any
+  // NOTIFY that arrives during the preceding poll SELECT is already
+  // queued in the connection's notification list -- select() would
+  // block for the full timeout waiting for more socket bytes.  Drain
+  // the queue first; if anything is there, return immediately so the
+  // next poll cycle picks it up.
+  {
+    PGnotify* n = nullptr;
+    bool got_any = false;
+    while ((n = PQnotifies(conn)) != nullptr) {
+      PQfreemem(n);
+      got_any = true;
+    }
+    if (got_any) return;
+  }
+  const int sock = PQsocket(conn);
+  const auto deadline = std::chrono::steady_clock::now()
+                      + std::chrono::milliseconds(timeout_ms);
+  while (running.load()) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) return;
+    const int remaining_ms = static_cast<int>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - now).count());
+    // Cap the individual select() at 1 s so stop() gets promptly noticed.
+    const int slice_ms = std::min(1000, remaining_ms);
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    if (sock >= 0) FD_SET(sock, &rfds);
+    timeval tv{slice_ms / 1000, (slice_ms % 1000) * 1000};
+    int rc = ::select(sock >= 0 ? sock + 1 : 0,
+                      sock >= 0 ? &rfds : nullptr,
+                      nullptr, nullptr, &tv);
+    if (rc < 0) {
+      if (errno == EINTR) continue;
+      return;  // caller re-tries the loop, which reconnects on demand
+    }
+    if (rc == 0) continue;  // timeout slice -- loop and check running
+    if (!PQconsumeInput(conn)) return;  // conn broken; caller reconnects
+    PGnotify* n = nullptr;
+    bool got_any = false;
+    while ((n = PQnotifies(conn)) != nullptr) {
+      PQfreemem(n);
+      got_any = true;
+    }
+    if (got_any) return;
+  }
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Helpers (exposed via namespace motion_poller_internal for testing)
@@ -301,6 +424,8 @@ struct MotionPoller::Impl {
   std::string protect_url;       // empty = HTTP-fallback disabled
   ProtectUserIdProvider* protect_user_id_provider{nullptr};
   int poll_interval_sec{10};
+  bool push_mode{true};
+  bool trigger_installed{false};    // true once LISTEN is up on impl_->conn
   uint32_t coalesce_window_sec{30};
   bool use_msr_thumb_ids{false};
   MsrClient* msr_client{nullptr};
@@ -404,6 +529,10 @@ void MotionPoller::set_always_smart_detect(bool on,
 
 void MotionPoller::set_poll_interval(int sec) {
   impl_->poll_interval_sec = sec;
+}
+
+void MotionPoller::set_push_mode(bool enabled) {
+  impl_->push_mode = enabled;
 }
 
 void MotionPoller::set_coalesce_window(uint32_t sec) {
@@ -540,30 +669,69 @@ void MotionPoller::init_high_water_marks() {
 // shows whether each camera is producing the `motion` events the poller
 // looks for, vs `smartDetectZone` (already-classified) or nothing at all.
 void MotionPoller::log_event_type_breakdown(const char* label) {
+  if (impl_->camera_ids.empty()) return;
+
   const uint64_t since_ms = util::now_ms() - 3600000ULL;  // last hour
   const std::string since_str = std::to_string(since_ms);
+
+  // Batched into one round-trip via cameraId = ANY($1::text[]).  The old
+  // per-camera loop issued N queries at startup + every 30 minutes;
+  // consolidating to one aggregate scan cuts the DB traffic by (N-1)/N
+  // (7/8 for gleep52's 8-camera fleet on issue #34).
+  std::string cam_array = "{";
+  bool first_id = true;
   for (const auto& cam_id : impl_->camera_ids) {
-    impl_->maybe_reconnect();
-    const char* params[] = { cam_id.c_str(), since_str.c_str() };
-    PGresult* res = onvif::pg::ExecParamsWithTimeout(impl_->conn, -1,
-      "SELECT type, COUNT(*) FROM events "
-      "WHERE \"cameraId\" = $1 AND start > $2::bigint "
-      "GROUP BY type ORDER BY 2 DESC",
-      2, nullptr, params, nullptr, nullptr, 0);
-    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-      PQclear(res);
-      continue;
-    }
-    std::string summary;
-    const int n = PQntuples(res);
-    for (int i = 0; i < n; ++i) {
-      if (i > 0) summary += ' ';
-      summary += PQgetvalue(res, i, 0);
-      summary += '=';
-      summary += PQgetvalue(res, i, 1);
-    }
+    if (!first_id) cam_array += ',';
+    first_id = false;
+    cam_array += cam_id;  // 24-char hex, no quoting needed
+  }
+  cam_array += "}";
+
+  impl_->maybe_reconnect();
+  const char* params[] = { cam_array.c_str(), since_str.c_str() };
+  PGresult* res = onvif::pg::ExecParamsWithTimeout(impl_->conn, -1,
+    "SELECT \"cameraId\", type, COUNT(*) FROM events "
+    "WHERE \"cameraId\" = ANY($1::text[]) AND start > $2::bigint "
+    "GROUP BY \"cameraId\", type",
+    2, nullptr, params, nullptr, nullptr, 0);
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    LOG(WARNING) << "[motion_poller] batched event-type breakdown failed: "
+                 << PQerrorMessage(impl_->conn);
     PQclear(res);
-    if (summary.empty()) summary = "(no events in last 1h)";
+    return;
+  }
+
+  // Assemble per-camera summaries: {cam_id -> [(type, count), ...]}
+  // sorted by count desc for readability.
+  std::unordered_map<std::string, std::vector<std::pair<std::string, int>>>
+      per_camera;
+  const int n = PQntuples(res);
+  for (int i = 0; i < n; ++i) {
+    per_camera[PQgetvalue(res, i, 0)].emplace_back(
+        PQgetvalue(res, i, 1),
+        std::atoi(PQgetvalue(res, i, 2)));
+  }
+  PQclear(res);
+  for (auto& [cam_id, rows] : per_camera) {
+    std::sort(rows.begin(), rows.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+  }
+
+  // Emit one line per camera in the order the poller was configured, so
+  // the journal preserves the visual grouping users are used to.
+  for (const auto& cam_id : impl_->camera_ids) {
+    auto it = per_camera.find(cam_id);
+    std::string summary;
+    if (it == per_camera.end() || it->second.empty()) {
+      summary = "(no events in last 1h)";
+    } else {
+      for (size_t i = 0; i < it->second.size(); ++i) {
+        if (i > 0) summary += ' ';
+        summary += it->second[i].first;
+        summary += '=';
+        summary += std::to_string(it->second[i].second);
+      }
+    }
     LOG(INFO) << "[motion_poller] " << label << " camera " << cam_id
               << " last 1h: " << summary;
   }
@@ -585,6 +753,23 @@ void MotionPoller::poll_loop() {
   }
 
   init_high_water_marks();
+
+  // (A2) Optional push mode: install the events-INSERT trigger and
+  // LISTEN for NOTIFYs on the recorder's DB connection.  When active,
+  // the poll cycle at the bottom of this loop wakes on the first
+  // matching NOTIFY rather than sleeping for poll_interval_sec, so
+  // steady-state query rate drops from
+  //   (cameras x cycles/min) to (motion events/min).
+  // On any failure (trigger cannot be created, LISTEN rejected, ...)
+  // we fall back to the classic interval poll for the rest of this
+  // run.
+  if (impl_->push_mode) {
+    impl_->maybe_reconnect();
+    impl_->trigger_installed =
+        try_install_motion_trigger_and_listen(impl_->conn);
+  } else {
+    LOG(INFO) << "[motion_poller] push mode disabled -- interval poll";
+  }
 
   // (B) Per-camera event-type breakdown at startup.  Tells us
   // immediately whether the cameras are emitting `motion` (what the
@@ -626,58 +811,38 @@ void MotionPoller::poll_loop() {
       const std::string hwm_str = std::to_string(cam_hwm);
       const char* params[] = { cam_id.c_str(), hwm_str.c_str() };
 
-      // (D) Count motion events in the same window that WOULD have
-      // matched but were excluded by the NOT EXISTS smartDetectZone
-      // filter.  Lets the journal show "we had candidates but Protect
-      // already classified them" -- otherwise they're invisible.
-      {
-        PGresult* res_d = onvif::pg::ExecParamsWithTimeout(impl_->conn, -1,
-          "SELECT COUNT(*) FROM events e "
-          "WHERE e.type = 'motion' "
-          "  AND e.\"cameraId\" = $1 "
-          "  AND e.start > $2::bigint "
-          "  AND e.\"thumbnailId\" IS NOT NULL "
-          "  AND e.\"end\" IS NOT NULL "
-          "  AND EXISTS ( "
-          "    SELECT 1 FROM events e2 "
-          "    WHERE e2.type = 'smartDetectZone' "
-          "      AND e2.\"cameraId\" = e.\"cameraId\" "
-          "      AND e2.start >= e.start - 5000 "
-          "      AND e2.start <= e.\"end\" + 5000 "
-          "  )",
-          2, nullptr, params, nullptr, nullptr, 0);
-        if (PQresultStatus(res_d) == PGRES_TUPLES_OK &&
-            PQntuples(res_d) > 0) {
-          uint64_t n = static_cast<uint64_t>(
-              std::stoull(PQgetvalue(res_d, 0, 0)));
-          hb_skipped_overlap += n;
-        }
-        PQclear(res_d);
-      }
-
-      // Also pull the camera's prePaddingSecs from recordingSettings.
-      // events.start in Protect's schema is "first motion was detected
-      // minus prePaddingSecs"; the real motion moment is start + prePad.
-      // We use that to fetch a snapshot at the actual detection moment
-      // instead of Protect's chosen (often late / off-centre) thumbnail.
+      // Single per-camera SELECT that returns both the motion candidates
+      // AND a boolean `has_smartdetect_overlap` for each one, so we can
+      // both process the non-overlapping rows AND count the overlapping
+      // ones for the heartbeat display in one round-trip instead of
+      // two.  Previously the poll issued two nearly-identical queries
+      // (one COUNT with EXISTS(...), one SELECT with NOT EXISTS(...))
+      // per camera per cycle -- halving that cut ~96 correlated-subquery
+      // scans/min for an 8-camera first-party fleet on issue #34.
+      //
+      // The overlap count is now bounded to the same LIMIT window as
+      // the processing set; if a camera has more than 50 overlap events
+      // queued since hwm, the heartbeat under-counts them, but the log
+      // line is informational only and hwm advances every poll so the
+      // undercount converges to zero.
       PGresult* res = onvif::pg::ExecParamsWithTimeout(impl_->conn, -1,
         "SELECT e.id, e.start, e.\"end\", e.\"cameraId\", e.\"thumbnailId\", "
         "       COALESCE("
         "         (c.\"recordingSettings\"::jsonb->>'prePaddingSecs')::int,"
-        "         2) AS pre_padding_secs "
+        "         2) AS pre_padding_secs, "
+        "       EXISTS ( "
+        "         SELECT 1 FROM events e2 "
+        "         WHERE e2.type = 'smartDetectZone' "
+        "           AND e2.\"cameraId\" = e.\"cameraId\" "
+        "           AND e2.start >= e.start - 5000 "
+        "           AND e2.start <= e.\"end\" + 5000 "
+        "       ) AS has_smartdetect_overlap "
         "FROM events e JOIN cameras c ON c.id = e.\"cameraId\" "
         "WHERE e.type = 'motion' "
         "  AND e.\"cameraId\" = $1 "
         "  AND e.start > $2::bigint "
         "  AND e.\"thumbnailId\" IS NOT NULL "
         "  AND e.\"end\" IS NOT NULL "
-        "  AND NOT EXISTS ( "
-        "    SELECT 1 FROM events e2 "
-        "    WHERE e2.type = 'smartDetectZone' "
-        "      AND e2.\"cameraId\" = e.\"cameraId\" "
-        "      AND e2.start >= e.start - 5000 "
-        "      AND e2.start <= e.\"end\" + 5000 "
-        "  ) "
         "ORDER BY e.start ASC LIMIT 50",
         2, nullptr, params, nullptr, nullptr, 0);
 
@@ -689,11 +854,22 @@ void MotionPoller::poll_loop() {
       }
 
       const int nrows = PQntuples(res);
+      // hb_candidates counts every motion candidate returned by the
+      // combined query; hb_skipped_overlap counts the subset whose
+      // has_smartdetect_overlap column is true.  The processing loop
+      // below skips those rows the same way the NOT EXISTS clause used
+      // to.
       hb_candidates += static_cast<uint64_t>(nrows);
       if (nrows > 0)
         LOG(INFO) << "[motion_poller] poll returned " << nrows
-                  << " motion event(s) to process for camera " << cam_id;
+                  << " motion event(s) to consider for camera " << cam_id;
       for (int i = 0; i < nrows && running_.load(); ++i) {
+        const bool has_overlap =
+            std::string(PQgetvalue(res, i, 6)) == "t";
+        if (has_overlap) {
+          ++hb_skipped_overlap;
+          continue;
+        }
         const std::string ev_id      = PQgetvalue(res, i, 0);
         const uint64_t    start_ms   =
             static_cast<uint64_t>(std::stoull(PQgetvalue(res, i, 1)));
@@ -1359,9 +1535,19 @@ void MotionPoller::poll_loop() {
       polls_since_breakdown = 0;
     }
 
-    // Sleep in short increments so stop() is responsive.
-    for (int s = 0; s < impl_->poll_interval_sec && running_.load(); ++s)
-      std::this_thread::sleep_for(std::chrono::seconds(1));
+    // Wait for the next work unit.  Push mode: block on the
+    // recorder's DB socket until a NOTIFY arrives on
+    // `onvif_recorder_motion`, with a 60 s safety-net timeout so
+    // dropped notifications can't cause missed events.  Interval mode
+    // (or push-install failed): sleep for poll_interval_sec in 1 s
+    // slices so stop() is responsive.
+    if (impl_->trigger_installed) {
+      wait_for_notify_or_timeout(impl_->conn, kSafetyNetTimeoutMs,
+                                  running_);
+    } else {
+      for (int s = 0; s < impl_->poll_interval_sec && running_.load(); ++s)
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
   }
 
   LOG(INFO) << "[motion_poller] stopped";

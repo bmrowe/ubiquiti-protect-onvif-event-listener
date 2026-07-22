@@ -72,10 +72,15 @@ std::optional<Detection> classify(const OnvifEvent& ev,
     if (rule_it == ev.source.end() || inside_it == ev.data.end())
       return {};
 
+    // Hikvision sends the rule name in the Rule field (e.g.
+    // "MyFieldDetector1") -- the camera's AcuSense classifier has
+    // already filtered to human/vehicle implicitly, so fall back to the
+    // default object type and let NanoDet-M refine the class on the
+    // snapshot.
     std::string type;
     if      (rule_it->second == "Human")   type = "human";
     else if (rule_it->second == "Vehicle") type = "vehicle";
-    else type = fallback_type;  // Hikvision sends rule name in Rule field (e.g. "MyFieldDetector1"); the cam's AcuSense classifier already filtered to human/vehicle implicitly, so fall back to default_object_type and let NanoDet-M refine the class on the snapshot.
+    else                                   type = fallback_type;
 
     return Detection{type, inside_it->second == "true", ev.event_time};
   }
@@ -940,35 +945,32 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
   }
 
   int purge_all_orphaned_rows() override {
+    // Each DELETE auto-commits individually so a slow purge on one
+    // table (e.g. smartDetectRaws timing out on a busy Protect DB --
+    // issue #34 gleep52 dump repeatedly hit the 60s ceiling here)
+    // doesn't roll back the others.  Purges are startup-once
+    // housekeeping; partial progress is strictly better than an
+    // all-or-nothing rollback that leaves everything for next boot.
     maybe_reconnect();
-    if (!begin_txn()) return 0;
     int total = 0;
-    int n;
-    n = purge_orphaned_smart_detect_raws();
-    if (n < 0) {
-      rollback_txn();
-      return 0;
+    for (const auto& step : {
+        std::pair{&PgBackend::purge_orphaned_smart_detect_raws,
+                  "smartDetectRaws"},
+        std::pair{&PgBackend::purge_orphaned_thumbnails,
+                  "thumbnails"},
+        std::pair{&PgBackend::purge_orphaned_smart_detect_objects,
+                  "smartDetectObjects"},
+        std::pair{&PgBackend::purge_orphaned_detection_labels,
+                  "detectionLabels"}}) {
+      const int n = (this->*step.first)();
+      if (n < 0) {
+        LOG(WARNING) << "[pg] purge " << step.second
+                     << " skipped (DB slow / query cancelled); "
+                        "will retry next startup";
+        continue;
+      }
+      total += n;
     }
-    total += n;
-    n = purge_orphaned_thumbnails();
-    if (n < 0) {
-      rollback_txn();
-      return 0;
-    }
-    total += n;
-    n = purge_orphaned_smart_detect_objects();
-    if (n < 0) {
-      rollback_txn();
-      return 0;
-    }
-    total += n;
-    n = purge_orphaned_detection_labels();
-    if (n < 0) {
-      rollback_txn();
-      return 0;
-    }
-    total += n;
-    if (!commit_txn()) return 0;
     return total;
   }
 

@@ -330,6 +330,17 @@ ABSL_FLAG(std::string, first_party_camera_models, "",
 ABSL_FLAG(int32_t, poll_interval_sec, 10,
     "Seconds between motion-event poll cycles for first-party cameras. "
     "Only active when first-party cameras are discovered.");
+ABSL_FLAG(bool, motion_push, true,
+    "Reactive motion polling via Postgres LISTEN/NOTIFY. When true "
+    "(default), motion_poller installs an AFTER-INSERT trigger on the "
+    "`events` table that fires pg_notify('onvif_recorder_motion', <id>) "
+    "for type='motion' rows, then blocks on the LISTEN socket instead "
+    "of polling on a fixed interval -- the poller wakes on the first "
+    "matching event and steady-state DB query rate drops from "
+    "(cameras x cycles/min) to (motion events/min). A 60-second "
+    "safety-net poll still runs regardless so a dropped notification "
+    "can't cause missed events. Set to false to keep the legacy "
+    "interval poll (--poll_interval_sec).");
 ABSL_FLAG(bool, patch_alarm_picker, true,
     "Live-patch the Protect UI (swai.js) to allow third-party cameras "
     "in the alarm creation picker. The patch is idempotent and re-applied "
@@ -1023,6 +1034,7 @@ int main(int argc, char* argv[]) {
           motion_poller->set_ubv_dir(thumbs_dir);
         motion_poller->set_poll_interval(
             absl::GetFlag(FLAGS_poll_interval_sec));
+        motion_poller->set_push_mode(absl::GetFlag(FLAGS_motion_push));
         motion_poller->set_coalesce_window(
             static_cast<uint32_t>(absl::GetFlag(FLAGS_coalesce_window_sec)));
         motion_poller->set_use_msr_thumbnail_ids(use_msr_thumb_ids);
