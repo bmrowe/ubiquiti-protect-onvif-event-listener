@@ -449,34 +449,71 @@ void MotionPoller::stop() {
 void MotionPoller::init_high_water_marks() {
   const uint64_t default_hwm = util::now_ms() - 3600000ULL;  // 1 hour ago
 
+  // Pre-populate every camera's hwm with default_hwm so any camera missing
+  // from the aggregate result (no recent smartDetectZone from us) starts
+  // out at (now - 1h) without a per-camera round-trip.
+  for (const auto& cam_id : impl_->camera_ids)
+    impl_->hwm[cam_id] = default_hwm;
+
+  if (impl_->camera_ids.empty()) return;
+
+  // One aggregate round-trip for every camera, bounded to the last 7 days.
+  // Without the time bound this hit the `metadata::jsonb->>'source'`
+  // expression on every historical smartDetectZone row and repeatedly
+  // timed out at 60s per camera on active-events tables (issue #34).
+  //
+  // Backfill (--motion_backfill_days) still pulls the hwm back further
+  // below; we do not need older rows here because the poll loop's
+  // NOT EXISTS smartDetectZone filter skips already-classified events.
+  std::string cam_array = "{";
+  bool first_id = true;
   for (const auto& cam_id : impl_->camera_ids) {
-    impl_->maybe_reconnect();
-    const std::string def_str = std::to_string(default_hwm);
-    const char* params[] = { def_str.c_str(), cam_id.c_str() };
-    PGresult* res = onvif::pg::ExecParamsWithTimeout(impl_->conn, -1,
-      "SELECT COALESCE(MAX(e.start), $1::bigint) "
-      "FROM events e "
-      "WHERE e.type = 'smartDetectZone' "
-      "  AND e.\"cameraId\" = $2 "
-      "  AND (e.metadata::jsonb->>'source') = 'onvif-recorder'",
-      2, nullptr, params, nullptr, nullptr, 0);
+    if (!first_id) cam_array += ',';
+    first_id = false;
+    cam_array += cam_id;  // 24-char hex, no quoting needed
+  }
+  cam_array += "}";
 
-    uint64_t hwm = default_hwm;
-    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0)
-      hwm = static_cast<uint64_t>(std::stoull(PQgetvalue(res, 0, 0)));
+  const uint64_t floor_ms = util::now_ms() - 7ULL * 86'400'000ULL;
+  const std::string floor_str = std::to_string(floor_ms);
+
+  impl_->maybe_reconnect();
+  const char* params[] = { cam_array.c_str(), floor_str.c_str() };
+  PGresult* res = onvif::pg::ExecParamsWithTimeout(impl_->conn, 15'000,
+    "SELECT e.\"cameraId\", MAX(e.start) "
+    "FROM events e "
+    "WHERE e.type = 'smartDetectZone' "
+    "  AND e.\"cameraId\" = ANY($1::text[]) "
+    "  AND e.start > $2::bigint "
+    "  AND (e.metadata::jsonb->>'source') = 'onvif-recorder' "
+    "GROUP BY e.\"cameraId\"",
+    2, nullptr, params, nullptr, nullptr, 0);
+
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    LOG(WARNING) << "[motion_poller] batched hwm query failed; "
+                    "using default hwm (now - 1h) for every camera";
     PQclear(res);
+  } else {
+    for (int i = 0; i < PQntuples(res); ++i) {
+      const std::string cam_id = PQgetvalue(res, i, 0);
+      auto it = impl_->hwm.find(cam_id);
+      if (it != impl_->hwm.end())
+        it->second = static_cast<uint64_t>(std::stoull(PQgetvalue(res, i, 1)));
+    }
+    PQclear(res);
+  }
 
-    // Optional backfill: pull the HWM back to (now - N days) so the live
-    // poll loop re-scans recent motion events that didn't produce a
-    // smartDetectZone before (typical reason: an older code path or a
-    // NanoDet miss).  The poll SELECT's NOT EXISTS smartDetectZone filter
-    // means we naturally skip events that already have one -- only the
-    // ones we previously missed get reprocessed.  Live SDZ events from
-    // less than 60s ago will still trigger automations (see ts_ms / alarm
-    // age check in the live processing loop); older ones won't.
-    if (impl_->backfill_lookback_days > 0) {
-      const uint64_t backfill_floor = util::now_ms()
-          - static_cast<uint64_t>(impl_->backfill_lookback_days) * 86'400'000ULL;
+  // Apply optional backfill pull-back per camera (typical reason: an older
+  // code path or a NanoDet miss).  The poll SELECT's NOT EXISTS
+  // smartDetectZone filter means we naturally skip events that already
+  // have one -- only the ones we previously missed get reprocessed.  Live
+  // SDZ events from less than 60s ago will still trigger automations (see
+  // ts_ms / alarm age check in the live processing loop); older ones
+  // won't.
+  if (impl_->backfill_lookback_days > 0) {
+    const uint64_t backfill_floor = util::now_ms()
+        - static_cast<uint64_t>(impl_->backfill_lookback_days) * 86'400'000ULL;
+    for (auto& [cam_id, hwm] : impl_->hwm) {
       if (backfill_floor < hwm) {
         LOG(INFO) << "[motion_poller] camera " << cam_id
                   << " pulling hwm back from " << hwm
@@ -486,8 +523,9 @@ void MotionPoller::init_high_water_marks() {
         hwm = backfill_floor;
       }
     }
+  }
 
-    impl_->hwm[cam_id] = hwm;
+  for (const auto& [cam_id, hwm] : impl_->hwm) {
     LOG(INFO) << "[motion_poller] camera " << cam_id
               << " high-water mark: " << hwm;
   }
