@@ -39,6 +39,11 @@ class LogRing : public absl::LogSink {
   /// Return the current ring buffer contents as a string, oldest-first.
   std::string dump() const;
 
+  /// Return the last @p max_lines ERROR-level lines in the ring, newest-first.
+  /// Each line is emitted verbatim (with its "YYYY-MM-DD HH:MM:SS.mmm E ..."
+  /// prefix and trailing newline).  Cheap: single pass over the ring buffer.
+  std::string tail_errors(int max_lines) const;
+
  private:
   mutable absl::Mutex mu_;
   char buf_[kCapacity];

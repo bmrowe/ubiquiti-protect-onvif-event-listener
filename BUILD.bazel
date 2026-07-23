@@ -187,6 +187,7 @@ cc_library(
         ":contention_profiler",
         ":cpu_profiler",
         ":dump_sanitizer",
+        ":log_ring",
         ":onvif_listener",
         ":pg_stats",
         ":protect_user_id_provider",

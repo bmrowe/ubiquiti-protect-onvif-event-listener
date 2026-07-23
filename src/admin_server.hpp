@@ -26,6 +26,7 @@ struct MHD_Daemon;
 
 namespace onvif {
 
+class LogRing;
 class ProtectUserIdProvider;
 
 /// Minimal HTTP server that exposes an admin page + JSON API for managing the
@@ -60,6 +61,11 @@ class AdminServer {
              const std::string& event_log_path = "",
              GetOnvifHealthsFn get_onvif_healths = {});
 
+  /// Attach the shared LogRing so /api/recent_errors can serve the last
+  /// N error lines to the admin page.  Must be called before start().
+  /// The ring must outlive the AdminServer.
+  void set_log_ring(const LogRing* ring) { log_ring_ = ring; }
+
   /// Return the port the server is listening on. Only meaningful after a
   /// successful start().  Useful when start() was called with port=0.
   uint16_t port() const { return port_; }
@@ -75,6 +81,7 @@ class AdminServer {
 
  private:
   ::MHD_Daemon* daemon_{nullptr};
+  const LogRing* log_ring_{nullptr};
   std::string version_;
   std::string channel_file_;
   std::string config_path_;

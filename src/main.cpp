@@ -673,6 +673,7 @@ int main(int argc, char* argv[]) {
 
   // Start the admin page (loopback HTTP, proxied at /onvif/admin/).
   onvif::AdminServer admin_server;
+  admin_server.set_log_ring(&log_ring);
   const uint16_t admin_port = absl::GetFlag(FLAGS_admin_port);
   const std::string channel_file = absl::GetFlag(FLAGS_channel_file);
   if (admin_server.start(ONVIF_RECORDER_VERSION, channel_file, admin_port,

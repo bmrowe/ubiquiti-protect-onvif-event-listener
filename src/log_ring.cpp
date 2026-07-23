@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "absl/log/log_entry.h"
 #include "absl/log/log_sink.h"
@@ -95,6 +96,55 @@ std::string LogRing::dump() const {
   } else {
     out.append(buf_, head_);
   }
+  return out;
+}
+
+std::string LogRing::tail_errors(int max_lines) const {
+  // Ring format per line: "YYYY-MM-DD HH:MM:SS.mmm L file:line] ...".
+  // We test position 24 for 'E' -- that's the timestamp width (23) plus
+  // the space between timestamp and severity.  Snapshot the buffer under
+  // the lock, then scan lock-free.
+  std::string snap;
+  {
+    absl::MutexLock lk(&mu_);
+    snap.reserve(kCapacity);
+    if (wrapped_) {
+      snap.append(buf_ + head_, kCapacity - head_);
+      snap.append(buf_, head_);
+    } else {
+      snap.append(buf_, head_);
+    }
+  }
+  // Collect matching lines in a small deque-shaped rolling buffer.
+  std::vector<std::string> keep;
+  keep.reserve(max_lines > 0 ? max_lines : 32);
+  size_t line_start = 0;
+  const size_t n = snap.size();
+  while (line_start < n) {
+    size_t nl = snap.find('\n', line_start);
+    if (nl == std::string::npos) nl = n;
+    // Include newline in the emitted line so downstream <pre> renders
+    // cleanly.
+    const size_t line_end = (nl < n) ? nl + 1 : nl;
+    const size_t line_len = line_end - line_start;
+    // The first line after a wrap can start mid-message; skip it if it's
+    // shorter than the fixed prefix width or if the char at position 24
+    // isn't a plausible severity marker.
+    if (line_len > 25 &&
+        (snap[line_start + 23] == ' ') &&
+        (snap[line_start + 24] == 'E')) {
+      keep.emplace_back(snap, line_start, line_len);
+      if (max_lines > 0 &&
+          static_cast<int>(keep.size()) > max_lines) {
+        keep.erase(keep.begin());
+      }
+    }
+    line_start = line_end;
+  }
+  // Emit newest-first so the top of the block is the most recent error.
+  std::string out;
+  for (auto it = keep.rbegin(); it != keep.rend(); ++it)
+    out += *it;
   return out;
 }
 

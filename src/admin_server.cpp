@@ -52,6 +52,7 @@ typedef int MHD_Result;
 #include "cpu_profiler.hpp"
 #include "dump_sanitizer.hpp"
 #include "listener_status.hpp"
+#include "log_ring.hpp"
 #include "onvif_listener.hpp"
 #include "pg_stats.hpp"
 #include "protect_user_id_provider.hpp"
@@ -212,6 +213,10 @@ snapshot, and version info.  Attach this to a GitHub issue when reporting
 problems.</p>
 <div class="row"><button onclick="downloadDump()">Download diagnostic dump</button></div>
 <div class="msg" id="dump-msg"></div></div>
+
+<div class="card"><h2>Recent errors
+<span class="help" title="Last 20 ERROR-level log lines from the recorder's in-memory ring, newest first. Refreshes every 15 seconds. Empty when everything is healthy. For the full log stream (all levels) open /onvif/events/log.">?</span></h2>
+<pre id="errors-body" style="margin:0;max-height:220px;overflow:auto;background:#0a0d14;border:1px solid #2a3140;border-radius:4px;padding:8px;font-family:ui-monospace,monospace;font-size:11px;color:#e0a0a0;white-space:pre-wrap">Loading&hellip;</pre></div>
 
 <div class="card"><h2>Uninstall</h2>
 <div class="row"><label>Remove onvif-recorder and all patches</label>
@@ -677,10 +682,31 @@ loadConfig();
 loadCameraHealth();
 loadRecentEvents();
 loadPgStats();
+loadRecentErrors();
 setInterval(fetchStatus, 30000);
 setInterval(loadCameraHealth, 30000);
 setInterval(loadRecentEvents, 30000);
 setInterval(loadPgStats, 15000);
+setInterval(loadRecentErrors, 15000);
+async function loadRecentErrors(){
+  try{
+    const r = captureCsrf(await fetch('api/recent_errors'));
+    if (!r.ok) throw new Error('http ' + r.status);
+    const text = await r.text();
+    const el = document.getElementById('errors-body');
+    if (!text.trim()) {
+      el.style.color = '#9aa0a6';
+      el.textContent = 'No recent errors.';
+    } else {
+      el.style.color = '#e0a0a0';
+      el.textContent = text;
+    }
+  } catch(e) {
+    const el = document.getElementById('errors-body');
+    el.style.color = '#e0a0a0';
+    el.textContent = 'Failed to load errors: ' + e.message;
+  }
+}
 async function loadPgStats(){
   try{
     const r = captureCsrf(await fetch('api/pg_stats'));
@@ -896,6 +922,8 @@ struct Ctx {
   // when unset (e.g. dev-server or tests) camera_health.json omits the
   // pull_backoff_sec field.  Callable from any thread.
   std::function<std::vector<onvif::CameraHealth>()> get_onvif_healths;
+  // Optional shared log ring for /api/recent_errors.  null in tests.
+  const onvif::LogRing* log_ring{nullptr};
 };
 
 // Build a JSON response body for GET /api/status.
@@ -2104,6 +2132,17 @@ MHD_Result handler(
     body = build_recent_events_json(*ctx);
     content_type = "application/json";
   } else if (is_get &&
+             std::strcmp(url, "/api/recent_errors") == 0) {
+    // Serve the last 20 ERROR-level lines from the shared log ring so
+    // the admin page can render them without shipping the full 1 MiB
+    // dump.  Plain text keeps the client-side rendering trivial.
+    if (ctx->log_ring) {
+      body = ctx->log_ring->tail_errors(20);
+    } else {
+      body = "";
+    }
+    content_type = "text/plain; charset=utf-8";
+  } else if (is_get &&
              std::strcmp(url, "/api/pg_stats") == 0) {
     // Optional ?reset=1 clears the counters after emitting -- handy for
     // before/after comparisons.  We emit first so the caller sees the
@@ -2262,7 +2301,8 @@ bool AdminServer::start(const std::string& version,
   auto* ctx = new Ctx{version_.c_str(), channel_file_.c_str(),
                       config_path_.c_str(), &db_,
                       protect_url_.c_str(), protect_user_id_provider_,
-                      event_log_path_.c_str(), get_onvif_healths_};
+                      event_log_path_.c_str(), get_onvif_healths_,
+                      log_ring_};
 
   daemon_ = MHD_start_daemon(
       MHD_USE_INTERNAL_POLLING_THREAD,
