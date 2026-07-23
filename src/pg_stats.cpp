@@ -62,6 +62,21 @@ std::chrono::steady_clock::time_point& boot() {
   return t;
 }
 
+// Timestamps of the most recent success / timeout, expressed as
+// steady_clock time_points.  Default-constructed value == never seen.
+absl::Mutex& health_mu() {
+  static absl::Mutex m;
+  return m;
+}
+std::chrono::steady_clock::time_point& last_success() {
+  static std::chrono::steady_clock::time_point t{};
+  return t;
+}
+std::chrono::steady_clock::time_point& last_timeout() {
+  static std::chrono::steady_clock::time_point t{};
+  return t;
+}
+
 // Fingerprint: first 60 chars of the SQL, with runs of whitespace
 // collapsed to a single space and leading/trailing whitespace removed.
 // Enough to distinguish "SELECT MAX(start) FROM events" from
@@ -126,17 +141,41 @@ void RecordQueryStats(const char* sql,
                       bool timed_out) {
   const std::string fp = fingerprint(sql);
   (void)boot();  // ensure boot time is set
-  absl::MutexLock lk(&mu());
-  Bucket& b = buckets()[fp];
-  ++b.count;
-  if (timed_out) ++b.timeouts;
-  b.total_us += micros;
-  if (micros < b.min_us) b.min_us = micros;
-  if (micros > b.max_us) b.max_us = micros;
-  b.last_us = micros;
-  b.ring[b.ring_pos] = micros;
-  b.ring_pos = (b.ring_pos + 1) % Bucket::kRingCap;
-  if (b.ring_len < Bucket::kRingCap) ++b.ring_len;
+  const auto now = std::chrono::steady_clock::now();
+  {
+    absl::MutexLock lk(&mu());
+    Bucket& b = buckets()[fp];
+    ++b.count;
+    if (timed_out) ++b.timeouts;
+    b.total_us += micros;
+    if (micros < b.min_us) b.min_us = micros;
+    if (micros > b.max_us) b.max_us = micros;
+    b.last_us = micros;
+    b.ring[b.ring_pos] = micros;
+    b.ring_pos = (b.ring_pos + 1) % Bucket::kRingCap;
+    if (b.ring_len < Bucket::kRingCap) ++b.ring_len;
+  }
+  {
+    absl::MutexLock lk(&health_mu());
+    if (timed_out)
+      last_timeout() = now;
+    else
+      last_success() = now;
+  }
+}
+
+int64_t MsSinceLastSuccess() {
+  absl::MutexLock lk(&health_mu());
+  if (last_success() == std::chrono::steady_clock::time_point{}) return -1;
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - last_success()).count();
+}
+
+int64_t MsSinceLastTimeout() {
+  absl::MutexLock lk(&health_mu());
+  if (last_timeout() == std::chrono::steady_clock::time_point{}) return -1;
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - last_timeout()).count();
 }
 
 std::string StatsAsJson(int top_n) {

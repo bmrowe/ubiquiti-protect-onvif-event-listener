@@ -1215,6 +1215,22 @@ uint64_t DetectionRecorder::msr_calls_for_testing() const {
   return stats_msr_ok_.load() + stats_msr_fail_.load();
 }
 
+DetectionRecorder::MsrSnapshot DetectionRecorder::msr_snapshot() const {
+  const uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+  auto to_ms_since = [now_ns](uint64_t stamp_ns) -> int64_t {
+    if (stamp_ns == 0) return -1;
+    if (stamp_ns > now_ns) return 0;
+    return static_cast<int64_t>((now_ns - stamp_ns) / 1'000'000);
+  };
+  MsrSnapshot s;
+  s.total_ok      = stats_msr_ok_.load();
+  s.total_fail    = stats_msr_fail_.load();
+  s.ms_since_ok   = to_ms_since(stats_msr_last_ok_ns_.load());
+  s.ms_since_fail = to_ms_since(stats_msr_last_fail_ns_.load());
+  return s;
+}
+
 uint64_t DetectionRecorder::msr_burst_reuses_for_testing() const {
   return stats_msr_burst_reuses_.load();
 }
@@ -1566,6 +1582,9 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
         LOG(INFO) << '[' << ev.camera_ip << "] MSR stored snapshot as id="
                   << msr_id;
         stats_msr_ok_.fetch_add(1);
+        stats_msr_last_ok_ns_.store(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
         // Cache for the next event in this burst (under main lock to
         // keep msr_burst_cache_ access serialised).
         if (msr_burst_window_ms > 0) {
@@ -1574,6 +1593,9 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
         }
       } else {
         stats_msr_fail_.fetch_add(1);
+        stats_msr_last_fail_ns_.store(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
         if (msr_drop_on_failure) {
           // Dropping the snapshot is the right call here: writing it
           // ourselves into the same `thumbnails` table that Protect

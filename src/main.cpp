@@ -70,6 +70,7 @@
 #include "cameras_change_listener.hpp"
 #include "event_recovery.hpp"
 #include "motion_poller.hpp"
+#include "wedge_healer.hpp"
 #include "protect_version.hpp"
 #include "object_detect.hpp"
 #include "onvif_listener.hpp"
@@ -330,6 +331,17 @@ ABSL_FLAG(std::string, first_party_camera_models, "",
 ABSL_FLAG(int32_t, poll_interval_sec, 10,
     "Seconds between motion-event poll cycles for first-party cameras. "
     "Only active when first-party cameras are discovered.");
+ABSL_FLAG(bool, auto_heal_protect, true,
+    "When Protect's Postgres or MSR stops responding for more than 60 s "
+    "continuously, automatically run 'systemctl restart' on the affected "
+    "service(s). Two independent triggers: DB wedge (>=1 pg query timeout "
+    "in the window AND no successful queries in the same window) restarts "
+    "msp+msr+unifi-protect; MSR wedge (MSR StoreSnapshots failing "
+    "continuously) restarts msr only. Safeguards: no restart in the first "
+    "5 min after start, 5 min cooldown between restarts, hard cap of 4 "
+    "restarts per 24 h. Every restart is logged at ERROR level and "
+    "surfaced on the admin page's Recent errors card. Set to false to "
+    "disable and rely on the user to restart Protect manually.");
 ABSL_FLAG(bool, motion_push, true,
     "Reactive motion polling via Postgres LISTEN/NOTIFY. When true "
     "(default), motion_poller installs an AFTER-INSERT trigger on the "
@@ -1259,6 +1271,27 @@ int main(int argc, char* argv[]) {
     motion_poller->start();
   }
 
+  // Auto-heal: monitor pg_stats + msr for wedged Protect services and
+  // issue targeted `systemctl restart` if the wedge persists >60 s.
+  // See --auto_heal_protect flag docs for signal + safeguards.
+  std::unique_ptr<onvif::WedgeHealer> healer;
+  if (absl::GetFlag(FLAGS_auto_heal_protect)) {
+    healer = std::make_unique<onvif::WedgeHealer>();
+    healer->set_msr_snapshot_fn([&det_rec]() {
+      const auto s = det_rec.msr_snapshot();
+      return onvif::WedgeHealer::MsrSnapshot{
+          s.total_ok, s.total_fail, s.ms_since_ok, s.ms_since_fail};
+    });
+    healer->start();
+    LOG(INFO) << "[healer] auto-heal enabled (window="
+              << onvif::WedgeHealer::kWindowSec << "s, warmup="
+              << onvif::WedgeHealer::kWarmupSec << "s, cooldown="
+              << onvif::WedgeHealer::kCooldownSec << "s, cap="
+              << onvif::WedgeHealer::kMaxPerDay << "/24h)";
+  } else {
+    LOG(INFO) << "[healer] auto-heal disabled (--auto_heal_protect=false)";
+  }
+
   // CamerasChangeListener: re-flips featureFlags when Protect's controller
   // clobbers our enable_smart_detect writes (typically on adoption,
   // reconnect, and a few minutes into Protect's own start-up).  Pairs with
@@ -1347,6 +1380,8 @@ int main(int argc, char* argv[]) {
     rescan_thread.join();
   if (motion_poller)
     motion_poller->stop();
+  if (healer)
+    healer->stop();
   if (backfill_thread.joinable())
     backfill_thread.join();
   // Nudge the background auto-recover thread to exit and wait for it.

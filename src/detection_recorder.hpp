@@ -301,6 +301,16 @@ class DetectionRecorder {
   uint64_t msr_calls_for_testing() const;
   uint64_t msr_burst_reuses_for_testing() const;
 
+  // Snapshot for the WedgeHealer.  Cheap; no locks.  ms_since_ok /
+  // ms_since_fail are -1 when the corresponding event has never fired.
+  struct MsrSnapshot {
+    uint64_t total_ok      = 0;
+    uint64_t total_fail    = 0;
+    int64_t  ms_since_ok   = -1;
+    int64_t  ms_since_fail = -1;
+  };
+  MsrSnapshot msr_snapshot() const;
+
   // Defined in detection_recorder.cpp -- public so concrete backends in the
   // .cpp translation unit can inherit from it without friendship.
   struct IDbBackend {
@@ -599,6 +609,12 @@ class DetectionRecorder {
   std::atomic<uint64_t> stats_snapshots_{0};
   std::atomic<uint64_t> stats_msr_ok_{0};
   std::atomic<uint64_t> stats_msr_fail_{0};
+  // Wall-clock timestamps of the most recent MSR OK / fail, expressed as
+  // system_clock nanoseconds since epoch (0 = never seen).  Used by the
+  // WedgeHealer to decide whether MSR has been unresponsive long enough
+  // to warrant a targeted `systemctl restart msr.service`.
+  std::atomic<uint64_t> stats_msr_last_ok_ns_{0};
+  std::atomic<uint64_t> stats_msr_last_fail_ns_{0};
   std::atomic<uint64_t> stats_window_start_ms_{0};
 
   // Emit the hourly aggregate line if a window has elapsed.  Safe to call

@@ -29,6 +29,18 @@ void RecordQueryStats(const char* sql,
                       int64_t micros,
                       bool timed_out);
 
+// Wall-clock milliseconds since the last successful query completed.
+// Returns -1 if no query has ever completed successfully (i.e. we
+// haven't seen a healthy DB yet).  Used by the wedge healer to decide
+// whether the DB has been unresponsive for long enough to justify a
+// service restart.
+int64_t MsSinceLastSuccess();
+
+// Wall-clock milliseconds since the last query timeout.  Returns -1 if
+// no timeout has ever been observed.  A "wedge" is
+// MsSinceLastTimeout()  <  60000  &&  MsSinceLastSuccess() > 60000.
+int64_t MsSinceLastTimeout();
+
 // JSON snapshot of the current stats bucket, sorted by total_micros
 // descending.  Shape:
 //   { "since_boot_ms": ...,

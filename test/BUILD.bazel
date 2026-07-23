@@ -376,6 +376,13 @@ cc_test(
     }),
 )
 
+cc_test(
+    name = "test_wedge_healer",
+    srcs = ["test_wedge_healer.cpp"],
+    linkstatic = True,
+    deps = ["//:wedge_healer"],
+)
+
 filegroup(
     name = "bench_onvif_raw_log",
     srcs = ["testdata/bench_onvif.jsonl"],

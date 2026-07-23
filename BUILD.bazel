@@ -85,6 +85,18 @@ cc_library(
 )
 
 cc_library(
+    name = "wedge_healer",
+    srcs = ["src/wedge_healer.cpp"],
+    hdrs = ["src/wedge_healer.hpp"],
+    strip_include_prefix = "src",
+    deps = [
+        ":pg_stats",
+        "@com_google_absl//absl/log:log",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "pg_util",
     srcs = ["src/pg_util.cpp"],
     hdrs = ["src/pg_util.hpp"],
@@ -517,6 +529,7 @@ cc_binary(
         ":runtime_config",
         ":unifi_camera_config",
         ":util",
+        ":wedge_healer",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/flags:parse",
         "@com_google_absl//absl/log:globals",
