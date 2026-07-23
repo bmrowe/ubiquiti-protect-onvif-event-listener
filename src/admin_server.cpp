@@ -53,6 +53,7 @@ typedef int MHD_Result;
 #include "dump_sanitizer.hpp"
 #include "listener_status.hpp"
 #include "onvif_listener.hpp"
+#include "pg_stats.hpp"
 #include "protect_user_id_provider.hpp"
 #include "runtime_config.hpp"
 
@@ -110,6 +111,10 @@ font-weight:600;text-transform:uppercase;letter-spacing:.04em}
 .pill.yellow{background:#3a3020;color:#e6d38a}
 .pill.red{background:#3a1a1a;color:#e0a0a0}
 .pill.grey{background:#2a3140;color:#9aa0a6}
+.help{display:inline-block;width:14px;height:14px;border-radius:50%;
+background:#2a3140;color:#9aa0a6;font-size:10px;font-weight:600;text-align:center;
+line-height:14px;cursor:help;margin-left:4px;vertical-align:middle}
+.help:hover{background:#3a4255;color:#e8eaed}
 </style></head><body>
 <h1>ONVIF Recorder</h1>
 
@@ -125,7 +130,7 @@ font-weight:600;text-transform:uppercase;letter-spacing:.04em}
 <th style="padding:4px 6px">Last event</th>
 <th style="padding:4px 6px">1h</th>
 <th style="padding:4px 6px"></th>
-<th style="padding:4px 6px" title="Route thumbnail fetches through Protect's own snapshot API instead of hitting the camera directly. Useful for cameras that struggle with concurrent requests. Third-party cameras only.">Via Protect</th>
+<th style="padding:4px 6px">Via Protect<span class="help" title="Route thumbnail fetches through Protect's own /api/cameras/&lt;id&gt;/snapshot endpoint instead of hitting the camera's own HTTP snapshot server directly. Useful for cheap third-party cameras whose HTTP snapshot endpoint chokes or returns black frames while RTSP is streaming -- Protect is already decoding the stream, so we just grab a frame from that decode. Tradeoff: the frame is Protect's currently-decoded one, so there is 200-500 ms of slop vs the exact ONVIF-event moment. Third-party cameras only.">?</span></th>
 <th style="padding:4px 6px" title="Untick to skip this camera entirely (no ONVIF subscription for third-party, no motion polling for first-party). Useful when another integration (e.g. a UniFi AI Port) is already handling the same physical camera and would otherwise produce duplicate events. Saved as excluded_cameras (issue #42).">Enabled</th>
 </tr></thead>
 <tbody id="camhealth-body"><tr><td colspan="8">Loading…</td></tr></tbody></table>
@@ -136,6 +141,24 @@ font-weight:600;text-transform:uppercase;letter-spacing:.04em}
   <button id="save-enabled" onclick="saveEnabled()" disabled
           style="padding:4px 12px;font-size:12px">Save Enabled changes</button>
   <span id="save-enabled-msg" style="font-size:12px;color:#9aa0a6"></span>
+</div></div>
+
+<div class="card"><h2>Database load
+<span class="help" title="Wall-clock time for every SQL round-trip the recorder issues to Protect's Postgres, aggregated per query shape (first ~60 chars of SQL, whitespace-normalised, so calls with different bound params bucket together). Sorted by total time contributed. Timeouts count the number of round-trips that hit their per-query budget without a result. Reset the counters with the button to compare before/after a config change.">?</span></h2>
+<div style="max-height:280px;overflow-y:auto;overflow-x:auto"><table id="pgstats-table" style="width:100%;border-collapse:collapse;font-size:12px;font-family:ui-monospace,monospace">
+<thead><tr style="color:#9aa0a6;text-align:left">
+<th style="padding:4px 6px">SQL</th>
+<th style="padding:4px 6px;text-align:right">count</th>
+<th style="padding:4px 6px;text-align:right">timeouts</th>
+<th style="padding:4px 6px;text-align:right">total&nbsp;ms</th>
+<th style="padding:4px 6px;text-align:right">avg&nbsp;ms</th>
+<th style="padding:4px 6px;text-align:right">p95&nbsp;ms</th>
+<th style="padding:4px 6px;text-align:right">max&nbsp;ms</th>
+</tr></thead>
+<tbody id="pgstats-body"><tr><td colspan="7">Loading&hellip;</td></tr></tbody></table></div>
+<div style="margin-top:6px;display:flex;gap:12px;align-items:center;color:#9aa0a6;font-size:12px">
+  <span id="pgstats-summary"></span>
+  <button onclick="resetPgStats()" style="padding:2px 10px;font-size:12px">Reset counters</button>
 </div></div>
 
 <div class="card"><h2>Release channel</h2>
@@ -564,7 +587,7 @@ async function loadCameraHealth(){
       // request.  Interpreted as the camera rate-limiting us to avoid
       // DoS, so we back off exponentially up to 1 hour.
       const backoffPill = (c.pull_backoff_sec && c.pull_backoff_sec > 0)
-        ? ` <span class="pill yellow" title="Camera returns empty pulls instantly instead of honoring our 5s long-poll; backed off to protect it from over-polling. Resets automatically on the next event or long-poll response.">backoff ${fmtBackoff(c.pull_backoff_sec)}</span>`
+        ? ` <span class="pill yellow">backoff ${fmtBackoff(c.pull_backoff_sec)}</span><span class="help" title="Camera returns empty ONVIF PullMessages responses instantly instead of honoring our 5-second long-poll -- interpreted as the camera rate-limiting us to avoid over-polling. onvif-recorder backs off exponentially (up to 1 hour between pulls) so the camera stays healthy. Resets automatically on the next real event or a long-poll that gets held open properly.">?</span>`
         : '';
       // Via-Protect tickbox: third-party only.  First-party cameras use
       // Protect's native pipeline so this workaround doesn't apply.
@@ -653,9 +676,42 @@ loadFirstPartyCameras();
 loadConfig();
 loadCameraHealth();
 loadRecentEvents();
+loadPgStats();
 setInterval(fetchStatus, 30000);
 setInterval(loadCameraHealth, 30000);
 setInterval(loadRecentEvents, 30000);
+setInterval(loadPgStats, 15000);
+async function loadPgStats(){
+  try{
+    const r = captureCsrf(await fetch('api/pg_stats'));
+    if (!r.ok) throw new Error('http ' + r.status);
+    const s = await r.json();
+    const total = (s.queries||[]).reduce((a,q)=>a+q.total_ms,0);
+    const secs = (s.since_boot_ms/1000).toFixed(0);
+    document.getElementById('pgstats-summary').textContent =
+      `${(s.queries||[]).length} query shapes, ${total} ms total DB time in the last ${secs}s`;
+    document.getElementById('pgstats-body').innerHTML =
+      (s.queries||[]).slice(0,20).map(q=>{
+        const cls = q.timeouts > 0 ? 'style="color:#e0a0a0"' : '';
+        const sql = q.sql.replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        return `<tr ${cls}>
+          <td style="padding:2px 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:340px" title="${sql}">${sql}</td>
+          <td style="padding:2px 6px;text-align:right">${q.count}</td>
+          <td style="padding:2px 6px;text-align:right">${q.timeouts||0}</td>
+          <td style="padding:2px 6px;text-align:right">${q.total_ms}</td>
+          <td style="padding:2px 6px;text-align:right">${q.avg_ms}</td>
+          <td style="padding:2px 6px;text-align:right">${q.p95_ms}</td>
+          <td style="padding:2px 6px;text-align:right">${q.max_ms}</td></tr>`;
+      }).join('') || '<tr><td colspan="7">No queries yet.</td></tr>';
+  } catch(e) {
+    document.getElementById('pgstats-body').innerHTML =
+      `<tr><td colspan="7" style="color:#e0a0a0">Failed to load pg stats: ${e.message}</td></tr>`;
+  }
+}
+async function resetPgStats(){
+  try { await post('api/pg_stats?reset=1', {}); } catch(e){}
+  await loadPgStats();
+}
 </script>
 </body></html>
 )HTML";
@@ -2046,6 +2102,18 @@ MHD_Result handler(
   } else if (is_get &&
              std::strcmp(url, "/api/recent_events") == 0) {
     body = build_recent_events_json(*ctx);
+    content_type = "application/json";
+  } else if (is_get &&
+             std::strcmp(url, "/api/pg_stats") == 0) {
+    // Optional ?reset=1 clears the counters after emitting -- handy for
+    // before/after comparisons.  We emit first so the caller sees the
+    // last window before it's zeroed.
+    body = onvif::pg::StatsAsJson(/*top_n=*/50);
+    const char* reset = MHD_lookup_connection_value(
+        connection, MHD_GET_ARGUMENT_KIND, "reset");
+    if (reset != nullptr && (reset[0] == '1' || reset[0] == 't')) {
+      onvif::pg::ResetStats();
+    }
     content_type = "application/json";
   } else if (is_get &&
              std::strncmp(url, "/api/thumbnail", 14) == 0) {

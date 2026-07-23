@@ -74,11 +74,23 @@ cc_library(
 )
 
 cc_library(
+    name = "pg_stats",
+    srcs = ["src/pg_stats.cpp"],
+    hdrs = ["src/pg_stats.hpp"],
+    strip_include_prefix = "src",
+    deps = [
+        "@com_google_absl//absl/synchronization",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "pg_util",
     srcs = ["src/pg_util.cpp"],
     hdrs = ["src/pg_util.hpp"],
     strip_include_prefix = "src",
     deps = [
+        ":pg_stats",
         "@com_google_absl//absl/log:log",
     ] + _PQ,
     visibility = ["//visibility:public"],
@@ -176,6 +188,7 @@ cc_library(
         ":cpu_profiler",
         ":dump_sanitizer",
         ":onvif_listener",
+        ":pg_stats",
         ":protect_user_id_provider",
         ":runtime_config",
         ":unifi_camera_config",

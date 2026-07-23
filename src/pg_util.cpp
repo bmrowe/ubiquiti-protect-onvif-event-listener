@@ -23,6 +23,7 @@
 #include <string>
 
 #include "absl/log/log.h"
+#include "pg_stats.hpp"
 
 namespace onvif {
 namespace pg {
@@ -180,6 +181,7 @@ PGresult* ExecParamsWithTimeout(PGconn* conn,
                                  const int* param_formats,
                                  int result_format) {
   if (!conn) return nullptr;
+  const auto t0 = std::chrono::steady_clock::now();
   if (PQsendQueryParams(conn, sql, n_params, param_types, param_values,
                         param_lengths, param_formats, result_format) == 0) {
     LOG(ERROR) << "[pg] PQsendQueryParams failed: "
@@ -187,7 +189,11 @@ PGresult* ExecParamsWithTimeout(PGconn* conn,
                << " sql=" << TruncateSql(sql);
     return nullptr;
   }
-  return WaitForResult(conn, timeout_ms, sql);
+  PGresult* res = WaitForResult(conn, timeout_ms, sql);
+  const int64_t us = std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - t0).count();
+  RecordQueryStats(sql, us, /*timed_out=*/res == nullptr);
+  return res;
 }
 
 PGresult* ExecWithTimeout(PGconn* conn, int timeout_ms, const char* sql) {
@@ -197,12 +203,17 @@ PGresult* ExecWithTimeout(PGconn* conn, int timeout_ms, const char* sql) {
   // ...QueryParams family rejects that with "cannot insert multiple
   // commands into a prepared statement".
   if (!conn) return nullptr;
+  const auto t0 = std::chrono::steady_clock::now();
   if (PQsendQuery(conn, sql) == 0) {
     LOG(ERROR) << "[pg] PQsendQuery failed: " << PQerrorMessage(conn)
                << " sql=" << TruncateSql(sql);
     return nullptr;
   }
-  return WaitForResult(conn, timeout_ms, sql);
+  PGresult* res = WaitForResult(conn, timeout_ms, sql);
+  const int64_t us = std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - t0).count();
+  RecordQueryStats(sql, us, /*timed_out=*/res == nullptr);
+  return res;
 }
 
 }  // namespace pg
