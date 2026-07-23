@@ -57,14 +57,6 @@
 
 namespace onvif {
 
-// Process-wide test escape hatch.  Emulators used by the test suite
-// return empty PullMessagesResponse instantly; without disabling backoff
-// they would hang each emulator test at the schedule ceiling.  Real
-// cameras honor the PT5S long-poll and never hit this path.  Declared
-// at namespace scope (not inside OnvifListener) so CameraWorker can
-// consult it without threading the flag through the constructor.
-static std::atomic<bool> g_pull_backoff_disabled_for_test{false};
-
 // ============================================================
 // Library lifecycle
 // ============================================================
@@ -541,16 +533,6 @@ class CameraWorker {
           heartbeat_at = std::chrono::steady_clock::now()
                        + std::chrono::seconds(60);
         }
-        // If we've engaged backoff (camera has been returning empty
-        // PullMessagesResponse in < 4 s), wait before firing the next
-        // pull.  Renew and heartbeat above still fire on schedule so a
-        // long backoff doesn't drop the subscription.
-        const bool backoff_enabled =
-            !g_pull_backoff_disabled_for_test.load(
-                std::memory_order_relaxed);
-        const uint64_t backoff_ms = pull_backoff_ms_.load();
-        if (backoff_enabled && backoff_ms > 0)
-          sleep_interruptible_ms(backoff_ms);
         if (!running_) break;
         const uint64_t events_before = events_received_total_.load();
         auto pull_started = std::chrono::steady_clock::now();
@@ -558,37 +540,32 @@ class CameraWorker {
         auto pull_dur = std::chrono::steady_clock::now() - pull_started;
         const bool got_events =
             events_received_total_.load() > events_before;
-        // A well-behaved camera holds our PT5S long-poll open for
-        // ~5 s; use 4 s as the "camera honored the timeout" threshold.
-        constexpr auto kHonoredTimeout = std::chrono::milliseconds(4000);
-        if (ps.ok() && backoff_enabled) {
-          if (got_events || pull_dur >= kHonoredTimeout) {
-            // Reset backoff.  Log if we were in it so the transition is
-            // visible in the journal / diagnostic dump.
-            const uint64_t was = pull_backoff_ms_.exchange(0);
-            pull_backoff_since_ms_.store(0);
-            if (was > 0) {
-              LOG(INFO) << '[' << cfg_.ip
-                        << "] backoff reset -> resuming normal poll cadence"
-                        << " (was " << (was / 1000) << "s, "
-                        << (got_events ? "events received"
-                                       : "camera honored PT5S timeout")
-                        << ")";
-            }
-          } else {
-            // Fast empty response -- advance the backoff.
-            const uint64_t old_ms = pull_backoff_ms_.load();
-            const uint64_t new_ms = OnvifListener::next_backoff_ms(old_ms);
-            pull_backoff_ms_.store(new_ms);
-            if (old_ms == 0)
-              pull_backoff_since_ms_.store(util::now_ms());
-            LOG_EVERY_N(INFO, 4)
-                << '[' << cfg_.ip << "] backoff -> " << (new_ms / 1000)
-                << "s (camera returned empty in "
-                << std::chrono::duration_cast<std::chrono::milliseconds>(
-                       pull_dur).count()
-                << "ms, ignoring PT5S long-poll -- likely rate-limiting)";
-          }
+
+        // Post-pull rate limit.  ONVIF PullMessages carries an upper-bound
+        // timeout (we request PT5S), NOT a lower bound -- a camera whose
+        // event queue is empty is spec-compliant to return an empty
+        // PullMessagesResponse immediately.  Many real cameras do
+        // exactly this (Amcrest, some Reolinks).  We used to interpret
+        // fast empty responses as "camera is rate-limiting us" and back
+        // off exponentially up to 1 h, which silently delayed events on
+        // any spec-compliant chatty firmware.
+        //
+        // New rule: only for empty responses that came back before our
+        // requested timeout ("short side"), sleep 3x the pull duration
+        // before the next request.  This throttles busy-loops on
+        // fast-responding cameras without penalising cameras that hold
+        // the long-poll open (they cross the 4 s threshold and get
+        // polled again immediately when their turn ends).  Capped so a
+        // very slow-but-still-empty response can't stall us for
+        // minutes.
+        constexpr auto kLongPollHonored = std::chrono::milliseconds(4000);
+        constexpr auto kMaxIdleSleep    = std::chrono::milliseconds(30000);
+        if (ps.ok() && !got_events && pull_dur < kLongPollHonored) {
+          auto sleep_dur = pull_dur * 3;
+          if (sleep_dur > kMaxIdleSleep) sleep_dur = kMaxIdleSleep;
+          sleep_interruptible_ms(
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  sleep_dur).count());
         }
         // Publish health after every pull tick so the admin UI sees
         // backoff changes on its next refresh.
@@ -637,8 +614,6 @@ class CameraWorker {
     h.last_renew_ms         = last_renew_ms_.load();
     h.subscribed_at_ms      = subscribed_at_ms_.load();
     h.subscribed            = subscribed_at_ms_.load() != 0;
-    h.pull_backoff_sec      = pull_backoff_ms_.load() / 1000;
-    h.pull_backoff_since_ms = pull_backoff_since_ms_.load();
     return h;
   }
 
@@ -648,10 +623,6 @@ class CameraWorker {
   std::atomic<uint64_t> last_event_ms_{0};
   std::atomic<uint64_t> last_renew_ms_{0};
   std::atomic<uint64_t> subscribed_at_ms_{0};
-  // Current sleep interval before the next PullMessages call.  0 = no
-  // backoff.  Written by the pull loop after each tick; read by health().
-  std::atomic<uint64_t> pull_backoff_ms_{0};
-  std::atomic<uint64_t> pull_backoff_since_ms_{0};
   PublishHealthFn       publish_health_;
 
   void publish_current_health() {
@@ -1266,25 +1237,8 @@ size_t RawSink::compressed_bytes() const {
 }
 
 // ---------------------------------------------------------------
-// OnvifListener: backoff schedule + per-camera health surface
+// OnvifListener: per-camera health surface
 // ---------------------------------------------------------------
-
-void OnvifListener::disable_pull_backoff_for_test() {
-  g_pull_backoff_disabled_for_test.store(true, std::memory_order_relaxed);
-}
-
-// Schedule: 0 -> 2 s -> 4 s -> 8 s -> ... -> 3600 s (cap = 1 hour).
-// Rationale: doubling from a 2 s floor reaches 2048 s in 11 steps and
-// caps at 3600 s.  The camera might be perfectly healthy and simply
-// rate-limiting us to avoid DoS; when it starts returning events (or
-// starts honoring our PT5S long-poll again), the caller resets to 0.
-uint64_t OnvifListener::next_backoff_ms(uint64_t current_ms) {
-  constexpr uint64_t kMinMs = 2000;
-  constexpr uint64_t kMaxMs = 3600000;
-  if (current_ms == 0) return kMinMs;
-  const uint64_t doubled = current_ms * 2;
-  return doubled >= kMaxMs ? kMaxMs : doubled;
-}
 
 void OnvifListener::publish_health(const CameraHealth& h) {
   absl::MutexLock lock(&healths_mutex_);

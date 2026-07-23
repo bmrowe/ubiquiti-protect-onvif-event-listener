@@ -466,11 +466,6 @@ function pillFor(ageMs){
   if (m < 360)  return '<span class="pill amber">stale</span>';
   return '<span class="pill red">silent</span>';
 }
-function fmtBackoff(sec){
-  if (sec < 60)      return sec + 's';
-  if (sec < 3600)    return Math.floor(sec/60) + 'm';
-  return Math.floor(sec/3600) + 'h';
-}
 // via-Protect tick-box state.  Reset from server on every fetch; tracks
 // user edits so the Save button can commit them.  Keyed by camera IP
 // because that is the value shape camera_snapshot_via_protect uses.
@@ -587,13 +582,6 @@ async function loadCameraHealth(){
                    target="_blank" rel="noopener" style="color:#f0c674">issue #20</a> for the fix.
            </td></tr>`
         : '';
-      // ONVIF PullPoint backoff: engaged when the camera keeps returning
-      // empty PullMessagesResponse in < 4 s, ignoring our PT5S long-poll
-      // request.  Interpreted as the camera rate-limiting us to avoid
-      // DoS, so we back off exponentially up to 1 hour.
-      const backoffPill = (c.pull_backoff_sec && c.pull_backoff_sec > 0)
-        ? ` <span class="pill yellow">backoff ${fmtBackoff(c.pull_backoff_sec)}</span><span class="help" title="Camera returns empty ONVIF PullMessages responses instantly instead of honoring our 5-second long-poll -- interpreted as the camera rate-limiting us to avoid over-polling. onvif-recorder backs off exponentially (up to 1 hour between pulls) so the camera stays healthy. Resets automatically on the next real event or a long-poll that gets held open properly.">?</span>`
-        : '';
       // Via-Protect tickbox: third-party only.  First-party cameras use
       // Protect's native pipeline so this workaround doesn't apply.
       const checked = viaProtectLocal.has(c.host) ? 'checked' : '';
@@ -617,7 +605,7 @@ async function loadCameraHealth(){
         <td style="padding:4px 6px">${c.events_1h}</td>
         <td style="padding:4px 6px">${c.hint === 'needs_onvif_admin'
             ? '<span class="pill red">auth</span>'
-            : pillFor(age)}${backoffPill}</td>
+            : pillFor(age)}</td>
         <td style="padding:4px 6px;text-align:center">${viaCell}</td>
         <td style="padding:4px 6px;text-align:center">${enabledCell}</td>
       </tr>${hintRow}`;
@@ -919,8 +907,7 @@ struct Ctx {
   onvif::ProtectUserIdProvider* protect_user_id_provider;
   const char* event_log_path;     // value of --event_log; empty if disabled
   // Snapshot of per-camera health from the ONVIF listener.  Optional --
-  // when unset (e.g. dev-server or tests) camera_health.json omits the
-  // pull_backoff_sec field.  Callable from any thread.
+  // may be empty in dev-server / unit tests.  Callable from any thread.
   std::function<std::vector<onvif::CameraHealth>()> get_onvif_healths;
   // Optional shared log ring for /api/recent_errors.  null in tests.
   const onvif::LogRing* log_ring{nullptr};
@@ -1177,16 +1164,6 @@ std::string build_camera_health_json(const Ctx& ctx) {
     j += "]}";
     return j;
   }
-  // Merge in per-IP backoff state from the ONVIF listener.  Look up is
-  // by camera IP (== CameraHealth::ip) because the DB rows and the
-  // listener don't share an id.
-  std::map<std::string, onvif::CameraHealth> health_by_ip;
-  if (ctx.get_onvif_healths) {
-    for (auto& h : ctx.get_onvif_healths()) {
-      const std::string ip = h.ip;
-      health_by_ip[ip] = std::move(h);
-    }
-  }
   // Load the persisted camera_snapshot_via_protect and excluded_cameras
   // settings so the UI can pre-tick the right rows.  Reads the same
   // config.json the config form writes to, so this stays in sync with
@@ -1246,13 +1223,6 @@ std::string build_camera_health_json(const Ctx& ctx) {
     j += std::to_string(r.last_event_ms);
     j += ",\"events_1h\":";
     j += std::to_string(r.events_1h);
-    auto hit = health_by_ip.find(r.host);
-    if (hit != health_by_ip.end() && hit->second.pull_backoff_sec > 0) {
-      j += ",\"pull_backoff_sec\":";
-      j += std::to_string(hit->second.pull_backoff_sec);
-      j += ",\"pull_backoff_since_ms\":";
-      j += std::to_string(hit->second.pull_backoff_since_ms);
-    }
     if (r.is_third_party) {
       j += ",\"snapshot_via_protect\":";
       j += via_protect_ips.count(r.host) ? "true" : "false";
