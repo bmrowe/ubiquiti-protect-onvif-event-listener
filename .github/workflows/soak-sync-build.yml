@@ -105,12 +105,12 @@ jobs:
           git rebase upstream/main $PATCH_BRANCH   # fix conflicts, then push --force-with-lease
           \`\`\`
           The soak build is paused until this is resolved."
-          EXISTING=$(gh issue list --state open --search "$TITLE in:title" --json number -q '.[0].number')
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$TITLE in:title" --json number -q '.[0].number')
           if [ -n "$EXISTING" ]; then
-            gh issue comment "$EXISTING" --body "$BODY"
+            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "$BODY"
           else
-            gh issue create --title "$TITLE" --body "$BODY" --label "soak-sync" 2>/dev/null \
-              || gh issue create --title "$TITLE" --body "$BODY"
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY" --label "soak-sync" 2>/dev/null \
+              || gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY"
           fi
 
       # ---- Build (mirrors .github/workflows/release-deb.yml) ----
@@ -186,8 +186,9 @@ jobs:
           # the release so notes + assets are current.
           git tag -f "$RELEASE_TAG" "$SOAK_BRANCH"
           git push -f origin "refs/tags/$RELEASE_TAG"
-          gh release delete "$RELEASE_TAG" --yes 2>/dev/null || true
+          gh release delete "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
           gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
             --target "$SOAK_BRANCH" \
             --prerelease \
             --title "Soak build ${{ steps.ver.outputs.version }}" \
