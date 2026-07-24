@@ -1,0 +1,202 @@
+name: Soak sync + build
+
+# Keeps a `soak` branch = danielwoz/main + our Reolink fix, rebuilt daily,
+# and publishes the arm64 .deb to a rolling `soak-latest` prerelease.
+#
+# Design notes:
+#   * Runs from the fork's DEFAULT branch (GitHub only schedules workflows
+#     from there). It fetches upstream fresh each run; it does NOT rebase
+#     `main` itself.
+#   * "Our fix" is derived from the PR branch (${PATCH_BRANCH}) as the commits
+#     unique to it vs its merge-base with upstream. Robust across rebases.
+#   * A rebase/cherry-pick conflict never pushes a broken tree — it opens (or
+#     comments on) a tracking issue and fails the run for a human.
+#   * The rolling `soak-latest` release keeps a fixed-name asset
+#     (onvif-recorder_soak_arm64.deb) so the UNVR always has the same URL.
+
+on:
+  schedule:
+    - cron: '17 11 * * *'   # 11:17 UTC daily (~early morning US)
+  workflow_dispatch: {}      # manual "sync now" from the Actions tab
+
+permissions:
+  contents: write            # push soak branch, manage the release
+  issues: write              # open the conflict tracking issue
+
+concurrency:
+  group: soak-sync-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/danielwoz/ubiquiti-protect-onvif-event-listener.git
+  PATCH_BRANCH: fix/reolink-pet-and-drop-unclassified-motion
+  SOAK_BRANCH: soak
+  RELEASE_TAG: soak-latest
+  ASSET_STABLE: onvif-recorder_soak_arm64.deb
+
+jobs:
+  sync-and-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "onvif-soak-bot"
+          git config user.email "noreply@github.com"
+
+      - name: Fetch upstream + patch branch
+        id: fetch
+        run: |
+          git remote add upstream "$UPSTREAM"
+          git fetch --tags upstream main
+          git fetch origin "$PATCH_BRANCH"
+          git fetch origin "$SOAK_BRANCH" || echo "(no soak branch yet — first run)"
+          echo "upstream_sha=$(git rev-parse upstream/main)" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if no new upstream commits
+        id: guard
+        run: |
+          UP=$(git rev-parse upstream/main)
+          BUILD=yes
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] \
+             && git rev-parse -q --verify origin/$SOAK_BRANCH >/dev/null; then
+            BASE_BUILT=$(git merge-base origin/$SOAK_BRANCH upstream/main)
+            if [ "$BASE_BUILT" = "$UP" ]; then
+              echo "No new upstream commits since last soak build — skipping."
+              BUILD=no
+            fi
+          fi
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+
+      - name: Rebuild soak = upstream/main + our fix
+        id: rebase
+        if: steps.guard.outputs.build == 'yes'
+        run: |
+          set -e
+          PATCH_BASE=$(git merge-base upstream/main origin/$PATCH_BRANCH)
+          echo "Cherry-picking $(git rev-list --count $PATCH_BASE..origin/$PATCH_BRANCH) commit(s) from $PATCH_BRANCH"
+          git checkout -B "$SOAK_BRANCH" upstream/main
+          if ! git cherry-pick "$PATCH_BASE..origin/$PATCH_BRANCH"; then
+            CONFLICTS=$(git diff --name-only --diff-filter=U | paste -sd', ' -)
+            git cherry-pick --abort || true
+            echo "conflict=1" >> "$GITHUB_OUTPUT"
+            echo "conflict_files=$CONFLICTS" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          git push -f origin "$SOAK_BRANCH"
+
+      - name: Open/append conflict tracking issue
+        if: failure() && steps.rebase.outputs.conflict == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="⚠️ Soak sync: our fix no longer rebases onto upstream/main"
+          BODY="The daily soak sync could not replay \`$PATCH_BRANCH\` onto \`upstream/main\` (\`${{ steps.fetch.outputs.upstream_sha }}\`).
+
+          **Conflicting files:** ${{ steps.rebase.outputs.conflict_files }}
+
+          Resolve locally:
+          \`\`\`
+          git fetch origin && git fetch upstream main
+          git rebase upstream/main $PATCH_BRANCH   # fix conflicts, then push --force-with-lease
+          \`\`\`
+          The soak build is paused until this is resolved."
+          EXISTING=$(gh issue list --state open --search "$TITLE in:title" --json number -q '.[0].number')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" --body "$BODY" --label "soak-sync" 2>/dev/null \
+              || gh issue create --title "$TITLE" --body "$BODY"
+          fi
+
+      # ---- Build (mirrors .github/workflows/release-deb.yml) ----
+      - name: Init required submodules
+        if: steps.guard.outputs.build == 'yes'
+        run: |
+          git submodule update --init --depth 1 \
+              third_party/zstd \
+              third_party/gperftools
+
+      - name: Install system deps
+        if: steps.guard.outputs.build == 'yes'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang cmake ninja-build perl lld nasm \
+            python3-pip curl git dpkg-dev fakeroot xz-utils qemu-user-static \
+            binutils-aarch64-linux-gnu reprepro gnupg lintian \
+            autoconf automake libtool pkg-config m4
+          pip3 install --break-system-packages cpplint
+
+      - name: Install Bazel
+        if: steps.guard.outputs.build == 'yes'
+        run: |
+          sudo curl -fsSL -o /usr/local/bin/bazel \
+            https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64
+          sudo chmod +x /usr/local/bin/bazel
+
+      - name: Fetch NanoDet-M model files
+        if: steps.guard.outputs.build == 'yes'
+        run: |
+          curl -fL -o nanodet_m.param \
+            https://github.com/nihui/ncnn-assets/raw/refs/heads/master/models/nanodet_m.param
+          curl -fL -o nanodet_m.bin \
+            https://github.com/nihui/ncnn-assets/raw/refs/heads/master/models/nanodet_m.bin
+
+      - name: Compute soak version
+        if: steps.guard.outputs.build == 'yes'
+        id: ver
+        run: |
+          BASE=$(git describe --tags --abbrev=0 upstream/main | sed 's/^v//')
+          VERSION="${BASE}+soak.$(date -u +%Y%m%d%H%M).g$(git rev-parse --short HEAD)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building soak version: $VERSION"
+
+      - name: Build ARM64 release binary
+        if: steps.guard.outputs.build == 'yes'
+        run: |
+          scripts/bz build --config=arm64_release //:onvif_recorder
+          cp ~/.cache/bazel/arm64_release/execroot/_main/bazel-out/k8-fastbuild/bin/onvif_recorder \
+             onvif_recorder_arm64
+
+      - name: Build .deb
+        if: steps.guard.outputs.build == 'yes'
+        run: |
+          scripts/build-deb.sh --arch=arm64 \
+            --binary=onvif_recorder_arm64 \
+            --version=${{ steps.ver.outputs.version }}
+          cp dist/onvif-recorder_${{ steps.ver.outputs.version }}_arm64.deb "dist/$ASSET_STABLE"
+
+      - name: Lint .deb
+        if: steps.guard.outputs.build == 'yes'
+        run: |
+          lintian --fail-on error --no-tag-display-limit \
+            dist/onvif-recorder_${{ steps.ver.outputs.version }}_arm64.deb || true
+
+      - name: Publish rolling soak-latest prerelease
+        if: steps.guard.outputs.build == 'yes'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Point the moving tag at the freshly built soak commit and recreate
+          # the release so notes + assets are current.
+          git tag -f "$RELEASE_TAG" "$SOAK_BRANCH"
+          git push -f origin "refs/tags/$RELEASE_TAG"
+          gh release delete "$RELEASE_TAG" --yes 2>/dev/null || true
+          gh release create "$RELEASE_TAG" \
+            --target "$SOAK_BRANCH" \
+            --prerelease \
+            --title "Soak build ${{ steps.ver.outputs.version }}" \
+            --notes "Rolling soak build: danielwoz/main (\`${{ steps.fetch.outputs.upstream_sha }}\`) + our Reolink pet fix / --drop_unclassified_motion, rebuilt $(date -u +%Y-%m-%dT%H:%MZ).
+
+          Install on the UNVR (stable URL):
+          \`\`\`
+          curl -fL -o /tmp/soak.deb https://github.com/${{ github.repository }}/releases/download/$RELEASE_TAG/$ASSET_STABLE
+          dpkg -i /tmp/soak.deb
+          \`\`\`" \
+            "dist/$ASSET_STABLE" \
+            "dist/onvif-recorder_${{ steps.ver.outputs.version }}_arm64.deb"
