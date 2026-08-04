@@ -2252,6 +2252,66 @@ static void test_reolink_face_and_animal_topics() {
                      std::to_string(animal));
 }
 
+// ONVIF ClassTypes drives the object class when the camera sends it.
+// The two indirect values matter most: a Face means a person is present,
+// a LicensePlate means a *vehicle* is present -- not a person.
+static void test_class_types_mapping() {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("test_class_types: CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_coalesce_window(0);
+  recorder.set_buffer(0, 0);
+
+  struct Case { const char* cls; const char* want; const char* ip; };
+  const Case cases[] = {
+    {"Human",        "[\"person\"]",  "192.168.1.210"},
+    {"Vehicle",      "[\"vehicle\"]", "192.168.1.211"},
+    {"Animal",       "[\"animal\"]",  "192.168.1.212"},
+    {"Face",         "[\"person\"]",  "192.168.1.213"},
+    {"LicensePlate", "[\"vehicle\"]", "192.168.1.214"},
+  };
+
+  for (const auto& c : cases) {
+    onvif::OnvifEvent ev;
+    ev.camera_ip   = c.ip;
+    ev.topic       = "tns1:RuleEngine/LineDetector/Crossed";
+    ev.event_time  = "2026-03-31T12:00:00Z";
+    ev.property_op = "Changed";
+    ev.data["ObjectId"]   = "1";
+    ev.data["ClassTypes"] = c.cls;
+    recorder.on_event(ev);
+  }
+
+  CHECK(bptr->events.size() == 5,
+        "expected 5 classified crossings, got " +
+            std::to_string(bptr->events.size()));
+
+  for (size_t i = 0; i < bptr->events.size() && i < 5; ++i) {
+    CHECK(bptr->events[i].sdt_json == cases[i].want,
+          std::string("ClassTypes=") + cases[i].cls + " should map to " +
+              cases[i].want + ", got " + bptr->events[i].sdt_json);
+  }
+
+  // An unrecognised ClassTypes falls back rather than inventing a class.
+  onvif::OnvifEvent odd;
+  odd.camera_ip   = "192.168.1.215";
+  odd.topic       = "tns1:RuleEngine/LineDetector/Crossed";
+  odd.event_time  = "2026-03-31T12:00:00Z";
+  odd.property_op = "Changed";
+  odd.data["ObjectId"]   = "1";
+  odd.data["ClassTypes"] = "Spaceship";
+  recorder.on_event(odd);
+  CHECK(bptr->events.size() == 6,
+        "unknown ClassTypes should still record via the fallback type");
+}
+
 static void test_coalesce_window() {
   auto backend = std::make_unique<MockBackend>();
   MockBackend* bptr = backend.get();
@@ -2903,6 +2963,8 @@ int main() {
   run_test("alt_port_camera",            [&] { test_alt_port_camera(ubv_dir); });
   run_test("unhandled_topic_records_nothing",
            [] { test_unhandled_topic_records_nothing(); });
+  run_test("class_types_mapping",
+           [] { test_class_types_mapping(); });
   run_test("line_crossing_synthetic_duration",
            [] { test_line_crossing_synthetic_duration(); });
   run_test("reolink_face_and_animal_topics",

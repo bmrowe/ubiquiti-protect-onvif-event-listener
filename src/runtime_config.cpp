@@ -40,6 +40,23 @@ const std::vector<Entry>& Schema() {
     {"max_events_per_hour", Type::Int,
      "Per-camera detection rate limit per hour.  Set to 0 for unlimited.",
      "Detection"},
+    {"pre_buffer_sec", Type::Int,
+     "Seconds of padding added before a detection's start time, so the "
+     "recorded clip begins slightly before the camera first saw the "
+     "subject.  Raise it if clips feel like they start mid-action.",
+     "Detection"},
+    {"post_buffer_sec", Type::Int,
+     "Seconds of padding added after a detection's end time.  Raise it if "
+     "clips cut off before the subject has left frame.",
+     "Detection"},
+    {"momentary_event_sec", Type::Int,
+     "Synthetic duration for momentary ONVIF events -- topics that fire "
+     "once and never report an end, of which IVS line crossing is the "
+     "usual case.  Such an event is recorded as "
+     "(start - pre_buffer) .. (start + this + post_buffer) and closed "
+     "immediately.  Raise it if line-crossing clips are too short to "
+     "review.",
+     "Detection"},
     {"coalesce_history", Type::Bool,
      "On startup, merge already-recorded events older than coalesce_window.",
      "Detection"},

@@ -104,18 +104,19 @@ bool is_known_non_detection_topic(const std::string& topic) {
 // ClassTypes is the ONVIF-standard object class and is far more
 // trustworthy than a vendor's Rule name -- the analytics engine that
 // tracked the object put it there.  Observed values in the field:
-// Human, Vehicle, Animal.  The spec also allows Face and LicensePlate,
-// which map onto the person class because Protect has no filter of
-// their own.
+// Human, Vehicle, Animal.
+//
+// The spec also allows Face and LicensePlate.  Protect has no filter
+// for either, so each maps to the class of the thing it is attached
+// to: a face means a person is there, a license plate means a vehicle
+// is there.
 std::string class_from_class_types(const OnvifEvent& ev) {
   auto it = ev.data.find("ClassTypes");
   if (it == ev.data.end() || it->second.empty()) return {};
   const std::string& v = it->second;
-  if (v == "Vehicle")      return "vehicle";
-  if (v == "Animal")       return "animal";
-  if (v == "Human" ||
-      v == "Face"  ||
-      v == "LicensePlate") return "human";
+  if (v == "Vehicle" || v == "LicensePlate") return "vehicle";
+  if (v == "Animal")                         return "animal";
+  if (v == "Human"   || v == "Face")         return "human";
   return {};
 }
 
