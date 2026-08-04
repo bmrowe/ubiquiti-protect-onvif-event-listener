@@ -2103,9 +2103,10 @@ static void test_unhandled_topic_records_nothing() {
     return ev;
   };
 
-  // Dahua IVS line crossing -- the exact topic from issue #45.
+  // A real ONVIF topic we deliberately do not support: it is neither a
+  // detection we can act on nor routine housekeeping, so it must warn.
   recorder.on_event(
-      make_ev("tns1:RuleEngine/LineDetector/Crossed", "Changed"));
+      make_ev("tns1:RuleEngine/CountAggregation/Counter", "Changed"));
   CHECK(bptr->events.empty(),
         "unhandled topic must not record an event, got " +
             std::to_string(bptr->events.size()));
@@ -2113,7 +2114,8 @@ static void test_unhandled_topic_records_nothing() {
   // Repeats stay silent and still record nothing (the warning is
   // deduped per camera+topic, but the drop behaviour is unconditional).
   recorder.on_event(
-      make_ev("tns1:RuleEngine/LineDetector/Crossed", "Changed"));
+      make_ev("tns1:RuleEngine/CountAggregation/Counter", "Changed"));
+  // Known housekeeping: silently ignored, and must not warn either.
   recorder.on_event(
       make_ev("tns1:Monitoring/ProcessorUsage", "Changed"));
   CHECK(bptr->events.empty(),
@@ -2123,7 +2125,7 @@ static void test_unhandled_topic_records_nothing() {
   // Initialized is the camera replaying its current state on subscribe;
   // it must not be reported as unhandled and must not record anything.
   recorder.on_event(
-      make_ev("tns1:RuleEngine/LineDetector/Crossed", "Initialized"));
+      make_ev("tns1:RuleEngine/CountAggregation/Counter", "Initialized"));
   CHECK(bptr->events.empty(),
         "Initialized unhandled topic must not record an event");
 
@@ -2140,6 +2142,114 @@ static void test_unhandled_topic_records_nothing() {
   CHECK(bptr->events.size() == 1,
         "supported topic after unhandled ones must still record, got " +
             std::to_string(bptr->events.size()));
+}
+
+// IVS line crossing (issue #45) is momentary: one notification, never an
+// "ended" one.  It must produce a *closed* event with the configured
+// synthetic duration rather than a row with end IS NULL that
+// purge_stale_open_events would delete five minutes later.
+static void test_line_crossing_synthetic_duration() {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("test_line_crossing: CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_buffer(0, 0);              // isolate the synthetic window
+  recorder.set_momentary_event_sec(6);
+  recorder.set_coalesce_window(0);        // no coalescing in this test
+
+  onvif::OnvifEvent ev;
+  ev.camera_ip   = "192.168.1.202";
+  ev.topic       = "tns1:RuleEngine/LineDetector/Crossed";
+  ev.event_time  = "2026-03-31T10:00:00Z";
+  ev.property_op = "Changed";
+  ev.data["ObjectId"] = "7";
+
+  recorder.on_event(ev);
+
+  CHECK(bptr->events.size() == 1,
+        "line crossing must record exactly one event, got " +
+            std::to_string(bptr->events.size()));
+
+  const auto& e = bptr->events.front();
+  CHECK(e.end_ms != 0,
+        "line-crossing event must be closed, not left open");
+  CHECK(e.end_ms > e.start_ms,
+        "line-crossing end must be after start");
+  const uint64_t span = e.end_ms - e.start_ms;
+  CHECK(span == 6000,
+        "synthetic span should be 6000ms (6s window, 0 buffers), got " +
+            std::to_string(span));
+
+  // PropertyOperation="Initialized" is the camera echoing its
+  // subscription set on (re)connect, not a crossing that just happened.
+  // A momentary topic has no state to replay, so it must be ignored --
+  // otherwise every reconnect invents an event.
+  onvif::OnvifEvent init_ev = ev;
+  init_ev.property_op = "Initialized";
+  recorder.on_event(init_ev);
+  CHECK(bptr->events.size() == 1,
+        "Initialized line crossing must not record an event, got " +
+            std::to_string(bptr->events.size()));
+
+  // A second, independent crossing records its own event.
+  onvif::OnvifEvent ev2 = ev;
+  ev2.event_time = "2026-03-31T10:05:00Z";
+  recorder.on_event(ev2);
+  CHECK(bptr->events.size() == 2,
+        "second crossing outside the coalesce window should record a new "
+        "event, got " + std::to_string(bptr->events.size()));
+}
+
+// Reolink's MyRuleDetector family: FaceDetect maps to the same object
+// type as PeopleDetect (a face implies a person), DogCatDetect maps to
+// Protect's broader "animal" class.  Both were previously dropped.
+static void test_reolink_face_and_animal_topics() {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("test_reolink_topics: CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_coalesce_window(0);
+
+  auto fire = [&](const char* topic, const char* ip, bool state) {
+    onvif::OnvifEvent ev;
+    ev.camera_ip   = ip;
+    ev.topic       = topic;
+    ev.event_time  = state ? "2026-03-31T11:00:00Z" : "2026-03-31T11:00:05Z";
+    ev.property_op = "Changed";
+    ev.data["State"] = state ? "true" : "false";
+    recorder.on_event(ev);
+  };
+
+  fire("tns1:RuleEngine/MyRuleDetector/FaceDetect",   "192.168.1.203", true);
+  fire("tns1:RuleEngine/MyRuleDetector/FaceDetect",   "192.168.1.203", false);
+  fire("tns1:RuleEngine/MyRuleDetector/DogCatDetect", "192.168.1.204", true);
+  fire("tns1:RuleEngine/MyRuleDetector/DogCatDetect", "192.168.1.204", false);
+
+  CHECK(bptr->events.size() == 2,
+        "FaceDetect + DogCatDetect should record 2 events, got " +
+            std::to_string(bptr->events.size()));
+
+  int person = 0, animal = 0;
+  for (const auto& e : bptr->events) {
+    if (e.sdt_json == "[\"person\"]") ++person;
+    if (e.sdt_json == "[\"animal\"]") ++animal;
+  }
+  CHECK(person == 1, "FaceDetect should map to person, got " +
+                     std::to_string(person));
+  CHECK(animal == 1, "DogCatDetect should map to animal, got " +
+                     std::to_string(animal));
 }
 
 static void test_coalesce_window() {
@@ -2793,6 +2903,10 @@ int main() {
   run_test("alt_port_camera",            [&] { test_alt_port_camera(ubv_dir); });
   run_test("unhandled_topic_records_nothing",
            [] { test_unhandled_topic_records_nothing(); });
+  run_test("line_crossing_synthetic_duration",
+           [] { test_line_crossing_synthetic_duration(); });
+  run_test("reolink_face_and_animal_topics",
+           [] { test_reolink_face_and_animal_topics(); });
   run_test("coalesce_window",            [] { test_coalesce_window(); });
   run_test("camera_coalesce_window_override",
            [] { test_camera_coalesce_window_override(); });

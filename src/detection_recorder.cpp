@@ -61,7 +61,40 @@ struct Detection {
   bool        started;       // true = detection began, false = detection ended
   std::string time;          // ISO-8601 UTC event_time from the OnvifEvent
   bool        from_fallback{false};  // true for generic motion (no ONVIF class)
+  // True for ONVIF topics that fire once with no matching "ended"
+  // notification (line crossing being the canonical case).  on_event()
+  // gives these a synthetic duration and closes them immediately rather
+  // than leaving a row with end IS NULL for the stale-event purge to
+  // delete five minutes later.
+  bool        momentary{false};
 };
+
+// Topics that are valid ONVIF but carry no detection we can act on --
+// device telemetry, I/O pin state, and scene-change/tamper signals.
+// Listed explicitly so the unhandled-topic warning stays a signal about
+// missing *detection* support rather than firing on every camera's
+// routine housekeeping.  Monitoring/OperatingTime/LastClockSynchronization
+// in particular sends PropertyOperation="Changed" on a timer, so without
+// this it would warn on virtually every camera.
+bool is_known_non_detection_topic(const std::string& topic) {
+  static const char* kPrefixes[] = {
+    "tns1:Monitoring/",            // ProcessorUsage, OperatingTime/*
+    "tns1:Device/Trigger/",        // DigitalInput, Relay
+    "tns1:VideoSource/GlobalSceneChange/",  // tamper / camera moved
+    "tns1:VideoSource/ImageTooBlurry",
+    "tns1:VideoSource/ImageTooDark",
+    "tns1:VideoSource/ImageTooBright",
+    "tns1:VideoSource/SignalLoss",
+    "tns1:VideoSource/ImagingService/",
+    "tns1:Media/",
+    "tns1:RecordingConfig/",
+    "tns1:PTZController/",
+  };
+  for (const char* p : kPrefixes) {
+    if (topic.rfind(p, 0) == 0) return true;
+  }
+  return false;
+}
 
 std::optional<Detection> classify(const OnvifEvent& ev,
                                    const std::string& fallback_type) {
@@ -111,6 +144,44 @@ std::optional<Detection> classify(const OnvifEvent& ev,
     auto it = ev.data.find("State");
     if (it == ev.data.end()) return {};
     return Detection{"vehicle", it->second == "true", ev.event_time};
+  }
+
+  // --- Reolink: face detection (MyRuleDetector) ---
+  // Same Source/State shape as the People/Vehicle siblings above.  A face
+  // implies a person, so it maps to the same object type Protect shows for
+  // PeopleDetect rather than introducing a class Protect has no filter for.
+  if (ev.topic == "tns1:RuleEngine/MyRuleDetector/FaceDetect") {
+    auto it = ev.data.find("State");
+    if (it == ev.data.end()) return {};
+    return Detection{"human", it->second == "true", ev.event_time};
+  }
+
+  // --- Reolink: animal detection (MyRuleDetector) ---
+  // Reolink names this DogCatDetect; Protect's equivalent smart-detect
+  // class is the broader "animal".
+  if (ev.topic == "tns1:RuleEngine/MyRuleDetector/DogCatDetect") {
+    auto it = ev.data.find("State");
+    if (it == ev.data.end()) return {};
+    return Detection{"animal", it->second == "true", ev.event_time};
+  }
+
+  // --- IVS line crossing (Dahua and compatibles) ---
+  // Momentary: the camera reports the instant an object crossed the line
+  // and never sends a matching "ended" notification, so there is no
+  // State/IsInside boolean to read.  ONVIF only guarantees ObjectId here;
+  // no object class is carried, so this behaves like generic motion --
+  // fallback_type unless NanoDet-M can refine it from the snapshot
+  // (from_fallback=true).  on_event() applies the synthetic duration.
+  if (ev.topic == "tns1:RuleEngine/LineDetector/Crossed") {
+    // Stateful topics can safely act on PropertyOperation="Initialized"
+    // because it carries a real current State/IsInside value.  A
+    // momentary topic has no state to replay -- an Initialized crossing
+    // is the camera echoing its subscription set, not something that
+    // just happened -- so acting on it would invent an event on every
+    // reconnect.
+    if (ev.property_op == "Initialized") return {};
+    return Detection{fallback_type, /*started=*/true, ev.event_time,
+                     /*from_fallback=*/true, /*momentary=*/true};
   }
 
   // --- Generic CellMotionDetector/Motion (Amcrest, Lorex, Dahua, etc.) ---
@@ -1271,6 +1342,11 @@ void DetectionRecorder::set_buffer(uint32_t pre_sec, uint32_t post_sec) {
   post_buffer_ms_ = static_cast<uint64_t>(post_sec) * 1000;
 }
 
+void DetectionRecorder::set_momentary_event_sec(uint32_t sec) {
+  absl::MutexLock lk(&mu_);
+  momentary_event_ms_ = static_cast<uint64_t>(sec) * 1000;
+}
+
 void DetectionRecorder::set_coalesce_window(uint32_t sec) {
   absl::MutexLock lk(&mu_);
   coalesce_window_ms_ = static_cast<uint64_t>(sec) * 1000;
@@ -1309,7 +1385,10 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
          ev.topic == "tns1:UserAlarm/IVA/HumanShapeDetect"         ||
          ev.topic == "tns1:VehicleAlarm/IVB/VehicleDetect"         ||
          ev.topic == "tns1:RuleEngine/MyRuleDetector/PeopleDetect"  ||
-         ev.topic == "tns1:RuleEngine/MyRuleDetector/VehicleDetect") &&
+         ev.topic == "tns1:RuleEngine/MyRuleDetector/VehicleDetect" ||
+         ev.topic == "tns1:RuleEngine/MyRuleDetector/FaceDetect"    ||
+         ev.topic == "tns1:RuleEngine/MyRuleDetector/DogCatDetect"  ||
+         ev.topic == "tns1:RuleEngine/LineDetector/Crossed") &&
         ev.property_op != "Initialized") {
       ai_capable_cameras_.insert(ev.camera_ip);
     } else if (ev.topic == "tns1:RuleEngine/CellMotionDetector/Motion" &&
@@ -1335,7 +1414,8 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     // the journal -- and therefore in every diagnostic dump -- instead
     // of looking silently dead.  The data keys go in the same line
     // because they are what a handler for the topic would need.
-    if (ev.property_op != "Initialized") {
+    if (ev.property_op != "Initialized" &&
+        !is_known_non_detection_topic(ev.topic)) {
       const std::string key = ev.camera_ip + "|" + ev.topic;
       bool first = false;
       {
@@ -1826,6 +1906,29 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     // Only notify for new events, not for detections coalesced into an existing one.
     if (coalesced_event_id.empty() && alarm_notif && !cam_mac.empty()) {
       alarm_notif->notify(obj_type, cam_mac, event_id, ts_ms);
+    }
+
+    // 6. Momentary topics (line crossing) never send an "ended"
+    // notification, so close the row here with a synthetic duration
+    // instead of leaving end IS NULL until purge_stale_open_events
+    // *deletes* it five minutes later.  Mirrors the normal close path
+    // below, but the end is derived from the event timestamp plus the
+    // configured window rather than from wall-clock at close time.
+    if (det->momentary) {
+      absl::MutexLock lk(&mu_);
+      auto it = open_.find(key);
+      if (it != open_.end()) {
+        const uint64_t unpadded_end = ts_ms + momentary_event_ms_;
+        const uint64_t end_ms       = unpadded_end + post_buffer_ms_;
+        const std::string now_str   = util::utc_now_iso8601();
+        const std::string ended_id  = it->second;
+        db_->update_event_end(ended_id, end_ms, now_str);
+        open_.erase(it);
+        // Same bookkeeping the normal close does, so a burst of
+        // crossings coalesces into one event rather than N adjacent
+        // ones.
+        last_event_[key] = {ended_id, unpadded_end};
+      }
     }
 
   } else {

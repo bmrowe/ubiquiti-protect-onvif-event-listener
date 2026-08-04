@@ -168,6 +168,15 @@ class DetectionRecorder {
   /// Pass 0 to disable. Default: 30 s.
   void set_coalesce_window(uint32_t sec);
 
+  /// Synthetic duration (seconds) for momentary ONVIF events -- topics
+  /// that fire once with no matching "ended" notification, of which IVS
+  /// line crossing (tns1:RuleEngine/LineDetector/Crossed) is the
+  /// canonical case.  The recorded event spans
+  ///   (start - pre_buffer) .. (start + this + post_buffer)
+  /// and is closed immediately, so it never sits with end IS NULL for
+  /// purge_stale_open_events to delete.  Default 4 seconds.
+  void set_momentary_event_sec(uint32_t sec);
+
   /// Per-camera override for the coalesce window.  Useful for noisy cameras
   /// whose onboard tracker briefly loses sight and re-fires events as "new"
   /// tracks (issue #29) -- bump the window for that camera without affecting
@@ -487,6 +496,11 @@ class DetectionRecorder {
 
   uint64_t pre_buffer_ms_{2000};   // subtracted from event start timestamp
   uint64_t post_buffer_ms_{2000};  // added to event end timestamp
+  // Synthetic duration given to momentary ONVIF events (line crossing),
+  // which fire once and never report an end.  Sits between the pre- and
+  // post-buffer windows, so the recorded event spans
+  //   (start - pre_buffer) .. (start + momentary + post_buffer).
+  uint64_t momentary_event_ms_{4000};
 
   // Snapshot info per camera IP -- written before run(), read-only after.
   std::map<std::string, SnapshotInfo> snapshot_info_;

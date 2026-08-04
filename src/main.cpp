@@ -98,6 +98,14 @@ ABSL_FLAG(int32_t, pre_buffer_sec, 2,
     "Seconds to buffer before the first detection event.");
 ABSL_FLAG(int32_t, post_buffer_sec, 2,
     "Seconds to buffer after the last detection event.");
+ABSL_FLAG(int32_t, momentary_event_sec, 4,
+    "Synthetic duration in seconds for momentary ONVIF events -- topics "
+    "that fire once and never report an end, of which IVS line crossing "
+    "(tns1:RuleEngine/LineDetector/Crossed) is the canonical case. The "
+    "recorded event spans (start - pre_buffer) .. (start + this + "
+    "post_buffer) and is closed immediately, so it never lingers with a "
+    "null end for the stale-event purge to delete. Raise it if line-cross "
+    "clips feel too short to review.");
 ABSL_FLAG(bool, verbose, false,
     "Enable verbose logging (INFO level): subscription lifecycle, "
     "events received, and renewals. Default logs errors only.");
@@ -561,6 +569,8 @@ int main(int argc, char* argv[]) {
       static_cast<uint32_t>(absl::GetFlag(FLAGS_pre_buffer_sec));
   const uint32_t post_buf_sec   =
       static_cast<uint32_t>(absl::GetFlag(FLAGS_post_buffer_sec));
+  const uint32_t momentary_sec  =
+      static_cast<uint32_t>(absl::GetFlag(FLAGS_momentary_event_sec));
 
   LOG(INFO) << "ONVIF Event Recorder starting";
   log_system_info();
@@ -781,6 +791,7 @@ int main(int argc, char* argv[]) {
   }
   onvif::DetectionRecorder& det_rec = **dr_or;
   det_rec.set_buffer(pre_buf_sec, post_buf_sec);
+  det_rec.set_momentary_event_sec(momentary_sec);
   det_rec.set_coalesce_window(
       static_cast<uint32_t>(absl::GetFlag(FLAGS_coalesce_window_sec)));
   det_rec.set_max_events_per_hour(
