@@ -522,6 +522,13 @@ class DetectionRecorder {
   // avoid double-counting (both topics fire simultaneously on most cameras).
   std::set<std::string> cell_motion_cameras_;
 
+  // "<camera_ip>|<topic>" pairs we have already reported as unhandled, so
+  // the warning fires once per camera per topic instead of on every
+  // event.  Cameras whose only events are on topics classify() does not
+  // recognise otherwise look completely dead to the user with nothing in
+  // the log to explain why (issue #45).
+  std::set<std::string> reported_unhandled_topics_;
+
   // Optional object detector for thumbnail subject cropping.
   // Set before run(); read-only (non-owning pointer) after that.
   const object_detect::ObjectDetector* detector_{nullptr};

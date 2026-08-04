@@ -1328,7 +1328,38 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
   }
 
   auto det = classify(ev, default_obj_type);
-  if (!det) return;
+  if (!det) {
+    // classify() didn't recognise this topic (or the payload was missing
+    // the state field it needs).  Report it once per camera+topic so a
+    // camera that only ever emits topics we don't support is visible in
+    // the journal -- and therefore in every diagnostic dump -- instead
+    // of looking silently dead.  The data keys go in the same line
+    // because they are what a handler for the topic would need.
+    if (ev.property_op != "Initialized") {
+      const std::string key = ev.camera_ip + "|" + ev.topic;
+      bool first = false;
+      {
+        absl::MutexLock lk(&mu_);
+        first = reported_unhandled_topics_.insert(key).second;
+      }
+      if (first) {
+        std::string keys;
+        for (const auto& [k, v] : ev.data) {
+          if (!keys.empty()) keys += ", ";
+          keys += k + "=" + v;
+        }
+        if (keys.empty()) keys = "(no data fields)";
+        LOG(WARNING) << '[' << ev.camera_ip << "] unhandled ONVIF topic \""
+                     << ev.topic << "\" -- no detection recorded. "
+                     << "Data: " << keys
+                     << ". Please report this line at "
+                     << "https://github.com/danielwoz/"
+                        "ubiquiti-protect-onvif-event-listener/issues "
+                     << "so support can be added.";
+      }
+    }
+    return;
+  }
   if (!cam_override_type.empty())
     det->type = cam_override_type;
 

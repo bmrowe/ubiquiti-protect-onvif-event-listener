@@ -2074,6 +2074,74 @@ static void test_alt_port_camera(const std::string& ubv_dir) {
 // Uses a 1-hour coalesce window so the test always coalesces regardless
 // of how fast (or slow) the host runs.
 // ============================================================
+// An ONVIF topic classify() does not recognise must be dropped without
+// recording anything -- and without wedging the recorder.  Cameras whose
+// only events are on unsupported topics (Dahua IVS line-crossing, issue
+// #45) otherwise look completely dead, so on_event() also emits a
+// one-per-camera-per-topic WARNING naming the topic and its data fields.
+// This test pins the no-detection contract; the log line itself is
+// verified by inspection since the recorder has no log sink hook.
+static void test_unhandled_topic_records_nothing() {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("test_unhandled_topic: CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+
+  auto make_ev = [](const char* topic, const char* op) {
+    onvif::OnvifEvent ev;
+    ev.camera_ip   = "192.168.1.201";
+    ev.topic       = topic;
+    ev.event_time  = "2026-03-31T10:00:00Z";
+    ev.property_op = op;
+    ev.data["ObjectId"] = "7";
+    return ev;
+  };
+
+  // Dahua IVS line crossing -- the exact topic from issue #45.
+  recorder.on_event(
+      make_ev("tns1:RuleEngine/LineDetector/Crossed", "Changed"));
+  CHECK(bptr->events.empty(),
+        "unhandled topic must not record an event, got " +
+            std::to_string(bptr->events.size()));
+
+  // Repeats stay silent and still record nothing (the warning is
+  // deduped per camera+topic, but the drop behaviour is unconditional).
+  recorder.on_event(
+      make_ev("tns1:RuleEngine/LineDetector/Crossed", "Changed"));
+  recorder.on_event(
+      make_ev("tns1:Monitoring/ProcessorUsage", "Changed"));
+  CHECK(bptr->events.empty(),
+        "repeat unhandled topics must not record events, got " +
+            std::to_string(bptr->events.size()));
+
+  // Initialized is the camera replaying its current state on subscribe;
+  // it must not be reported as unhandled and must not record anything.
+  recorder.on_event(
+      make_ev("tns1:RuleEngine/LineDetector/Crossed", "Initialized"));
+  CHECK(bptr->events.empty(),
+        "Initialized unhandled topic must not record an event");
+
+  // A supported topic on the same camera still works -- the unhandled
+  // path must not poison later events.
+  onvif::OnvifEvent good;
+  good.camera_ip   = "192.168.1.201";
+  good.topic       = "tns1:RuleEngine/FieldDetector/ObjectsInside";
+  good.event_time  = "2026-03-31T10:00:05Z";
+  good.property_op = "Changed";
+  good.source["Rule"]   = "Human";
+  good.data["IsInside"] = "true";
+  recorder.on_event(good);
+  CHECK(bptr->events.size() == 1,
+        "supported topic after unhandled ones must still record, got " +
+            std::to_string(bptr->events.size()));
+}
+
 static void test_coalesce_window() {
   auto backend = std::make_unique<MockBackend>();
   MockBackend* bptr = backend.get();
@@ -2723,6 +2791,8 @@ int main() {
            [&] { test_camera_object_types_multi(ubv_dir); });
   run_test("alarm_notify_animal",        [] { test_alarm_notify_animal(); });
   run_test("alt_port_camera",            [&] { test_alt_port_camera(ubv_dir); });
+  run_test("unhandled_topic_records_nothing",
+           [] { test_unhandled_topic_records_nothing(); });
   run_test("coalesce_window",            [] { test_coalesce_window(); });
   run_test("camera_coalesce_window_override",
            [] { test_camera_coalesce_window_override(); });
