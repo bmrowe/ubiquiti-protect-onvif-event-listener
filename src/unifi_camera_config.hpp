@@ -15,6 +15,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -179,6 +180,19 @@ absl::Status enable_smart_detect(
     const std::vector<FirstPartyCamera>& cameras,
     const DbConfig& db = {},
     CameraChangeLog* log = nullptr);
+
+/// Read back `featureFlags.smartDetectTypes` from Postgres for
+/// @p camera_ids, as raw JSON array text (e.g. `["person","vehicle"]`
+/// or `[]`).  Cameras absent from the table are omitted from the map.
+///
+/// Used by the featureFlags drift check: what we wrote here is compared
+/// against what Protect reports through its own API, to detect a
+/// long-running Protect process holding stale in-memory camera state
+/// (issue #34 -- Protect never re-reads the row, so our smartDetectZone
+/// events get filtered out of the UI even though the DB is correct).
+absl::StatusOr<std::map<std::string, std::string>>
+read_smart_detect_flags(const std::vector<std::string>& camera_ids,
+                        const DbConfig& db = {});
 
 /// Ensure the listed cameras have at least one smart-detect zone in the
 /// Protect database.  Cameras with an empty `smartDetectZones` array are

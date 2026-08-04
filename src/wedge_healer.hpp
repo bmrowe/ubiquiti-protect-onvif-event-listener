@@ -68,13 +68,27 @@ class WedgeHealer {
   // exit code.
   using ExecFn = std::function<int(const std::string&)>;
 
+  // Grace period after we write featureFlags before we conclude Protect
+  // is never going to re-read them.  Protect does pick some changes up on
+  // its own; only drift that survives this window counts.
+  static constexpr int kFlagDriftGraceSec = 60;
+
   // Reasons a restart fires; also used as the string identifier in the
   // ERROR log line so downstream grep-based dashboards can tag them.
   enum class Reason {
     kNone,
     kDbWedge,
     kMsrWedge,
+    kFlagDrift,
   };
+
+  // Callback that compares what we wrote into Postgres against what
+  // Protect's API reports in memory, for the given camera IDs.  Returns
+  // the subset whose featureFlags disagree (empty == Protect is in sync).
+  // Injected from main.cpp so this module needs neither libpq nor curl,
+  // and so tests can drive it without a live Protect.
+  using FlagDriftFn =
+      std::function<std::vector<std::string>(const std::vector<std::string>&)>;
   struct RestartRecord {
     Reason      reason;
     int64_t     ms_since_boot;   // when it fired
@@ -88,6 +102,18 @@ class WedgeHealer {
   // Attach dependencies before start().
   void set_msr_snapshot_fn(MsrSnapshotFn fn) { msr_snapshot_ = std::move(fn); }
   void set_exec_fn(ExecFn fn) { exec_ = std::move(fn); }
+  void set_flag_drift_fn(FlagDriftFn fn) { flag_drift_ = std::move(fn); }
+
+  // Arm a one-shot featureFlags drift check for @p camera_ids.  Call this
+  // immediately after enable_smart_detect() writes flags into Postgres.
+  // kFlagDriftGraceSec later the healer runs flag_drift_fn once; if any
+  // camera still disagrees, Protect is holding stale in-memory state
+  // (issue #34) and only a `systemctl restart unifi-protect` clears it.
+  //
+  // Deliberately one-shot and caller-armed: the healer never goes looking
+  // for drift on its own, so a restart can only ever follow a write we
+  // made.  Re-arming before the pending check runs merges the ID sets.
+  void arm_flag_drift_check(const std::vector<std::string>& camera_ids);
 
   // Spawn the monitor thread.  Idempotent; safe to call once.
   void start();
@@ -109,15 +135,31 @@ class WedgeHealer {
                           int64_t db_ms_since_timeout,
                           const MsrSnapshot& msr);
 
+  // Exposed for unit tests: run the pending flag-drift check immediately,
+  // bypassing the grace-period wait.  Returns the reason if it fired.
+  Reason check_flag_drift_for_testing();
+
  private:
   void run();
   Reason decide_wedge(int64_t db_ms_since_success,
                       int64_t db_ms_since_timeout,
                       const MsrSnapshot& msr) const;
-  void fire_restart(Reason r);
+  // Runs the armed drift check if its grace period has elapsed (or
+  // @p force).  Disarms afterwards either way.  Returns kFlagDrift if
+  // drift was found and a restart was requested.
+  Reason maybe_check_flag_drift(bool force);
+  // Returns true if the restart command actually ran; false when a
+  // safeguard (warmup / cooldown / daily cap) suppressed it.
+  bool fire_restart(Reason r);
 
   MsrSnapshotFn                     msr_snapshot_;
   ExecFn                            exec_;
+  FlagDriftFn                       flag_drift_;
+  // Pending one-shot drift check, guarded by drift_mu_.  armed_at_ is
+  // default-constructed when nothing is pending.
+  mutable std::mutex                drift_mu_;
+  std::vector<std::string>          drift_camera_ids_;
+  std::chrono::steady_clock::time_point drift_armed_at_{};
   std::atomic<bool>                 running_{false};
   std::thread                       thread_;
   std::atomic<uint64_t>             restart_count_{0};

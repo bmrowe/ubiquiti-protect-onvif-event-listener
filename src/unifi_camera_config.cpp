@@ -930,6 +930,41 @@ absl::Status enable_smart_detect(
 }
 
 // ---------------------------------------------------------------------------
+// read_smart_detect_flags — Postgres side of the featureFlags drift check
+// ---------------------------------------------------------------------------
+
+absl::StatusOr<std::map<std::string, std::string>>
+read_smart_detect_flags(const std::vector<std::string>& camera_ids,
+                        const DbConfig& db) {
+  std::map<std::string, std::string> out;
+  if (camera_ids.empty()) return out;
+
+  PgConn pg(db);
+  if (!pg.ok())
+    return absl::InternalError("unifi::read_smart_detect_flags: " + pg.error());
+
+  const std::string ids = internal::pg_array(camera_ids);
+  const char* params[] = { ids.c_str() };
+  PGresult* res = onvif::pg::ExecParamsWithTimeout(pg.conn, 10'000,
+      "SELECT id, COALESCE("
+      "         \"featureFlags\"::jsonb->'smartDetectTypes', '[]'::jsonb"
+      "       )::text "
+      "FROM cameras WHERE id = ANY($1::text[])",
+      1, nullptr, params, nullptr, nullptr, 0);
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    const std::string err = PQresultErrorMessage(res);
+    PQclear(res);
+    return absl::InternalError("unifi::read_smart_detect_flags query: " + err);
+  }
+  const int n = PQntuples(res);
+  for (int i = 0; i < n; ++i) {
+    out[PQgetvalue(res, i, 0)] = PQgetvalue(res, i, 1);
+  }
+  PQclear(res);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // ensure_smart_detect_zones — internal implementation
 //
 // Updates cameras in @p ids that have an empty smartDetectZones array.

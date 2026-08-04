@@ -876,11 +876,24 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
         "DELETE FROM events WHERE id = $1", 1, p);
   }
 
+  // Orphan purges are bounded to the last kPurgeWindowDays.  Without a
+  // bound this scanned every smartDetectRaws row ever written and
+  // evaluated an unindexed metadata::jsonb->>'source' extract per row,
+  // which reliably blew the 60 s statement budget on busy consoles
+  // (issue #34 -- gleep52's dump logs this exact timeout on every
+  // start-up, so the purge never actually ran).  Orphans are created by
+  // our own coalesce/delete paths, so anything older than the window was
+  // already handled by a previous run.
+  static constexpr int kPurgeWindowDays = 7;
+
   int purge_orphaned_smart_detect_raws() override {
     return exec_purge(
         "DELETE FROM \"smartDetectRaws\" sdr"
         " USING cameras c"
         " WHERE c.id = sdr.\"cameraId\""
+        "   AND sdr.timestamp > ("
+        "       extract(epoch from now()) * 1000"
+        "       - 7 * 86400000)::bigint"
         "   AND (c.\"isThirdPartyCamera\" = true"
         "        OR EXISTS ("
         "          SELECT 1 FROM events em"

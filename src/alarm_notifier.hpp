@@ -60,6 +60,14 @@ class AlarmNotifier {
   /// Fetch the current automation list from Protect API and cache it.
   void refresh_alarms();
 
+  /// One-shot authenticated GET against Protect's local API, returning the
+  /// response body ("" on any failure).  Shares the notifier's curl setup
+  /// (X-UserId bypass header, 5 s timeout) so callers outside the alarm
+  /// path -- notably the featureFlags drift check -- don't need their own
+  /// HTTP plumbing.
+  static std::string protect_api_get(const std::string& url,
+                                     const std::string& user_id);
+
   /// Trigger matching Protect automations for a detection event.
   ///   obj_type   -- "person", "vehicle", "animal", or "package"
   ///   camera_mac -- uppercase no-colon MAC, e.g. "FC5F49CA68D4"
@@ -103,8 +111,10 @@ class AlarmNotifier {
   // also writes the response body into `*body`.  Empty body and non-200
   // codes are surfaced to the caller, which decides whether to retry
   // after a user_id refresh.
-  long perform_get(const std::string& url, const std::string& user_id,  // NOLINT(runtime/int)
-                   std::string* body);
+  // NOLINTNEXTLINE(runtime/int)
+  static long perform_get(const std::string& url,
+                          const std::string& user_id,
+                          std::string* body);
   long perform_post(const std::string& url, const std::string& user_id,  // NOLINT(runtime/int)
                     const std::string& body);
   void record_history(const AutomationEntry& automation,

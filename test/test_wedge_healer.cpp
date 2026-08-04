@@ -97,6 +97,99 @@ int main() {
     assert(cmds.empty());
   }
 
+  // ---------------------------------------------------------------
+  // featureFlags drift (issue #34)
+  // ---------------------------------------------------------------
+
+  // Case 6: nothing armed -> the check is a no-op even if the drift fn
+  // would report drift.  The healer must never go looking on its own.
+  {
+    WedgeHealer h;
+    std::vector<std::string> cmds;
+    bool called = false;
+    h.set_exec_fn([&](const std::string& c) { cmds.push_back(c); return 0; });
+    h.set_flag_drift_fn([&](const std::vector<std::string>&) {
+      called = true;
+      return std::vector<std::string>{"cam1"};
+    });
+    const auto r = h.check_flag_drift_for_testing();
+    assert(r == WedgeHealer::Reason::kNone);
+    assert(!called);
+    assert(cmds.empty());
+  }
+
+  // Case 7: armed, drift fn reports everything in sync -> no restart.
+  {
+    WedgeHealer h;
+    std::vector<std::string> cmds;
+    h.set_exec_fn([&](const std::string& c) { cmds.push_back(c); return 0; });
+    h.set_flag_drift_fn([](const std::vector<std::string>&) {
+      return std::vector<std::string>{};  // no drift
+    });
+    h.arm_flag_drift_check({"cam1", "cam2"});
+    const auto r = h.check_flag_drift_for_testing();
+    assert(r == WedgeHealer::Reason::kNone);
+    assert(cmds.empty());
+  }
+
+  // Case 8: armed, drift reported -> kFlagDrift.  The restart itself is
+  // suppressed by warmup on a fresh healer, but the reason is returned so
+  // the caller (and the log) still record the detection.
+  {
+    WedgeHealer h;
+    std::vector<std::string> cmds;
+    std::vector<std::string> seen_ids;
+    h.set_exec_fn([&](const std::string& c) { cmds.push_back(c); return 0; });
+    h.set_flag_drift_fn([&](const std::vector<std::string>& ids) {
+      seen_ids = ids;
+      return std::vector<std::string>{"cam2"};
+    });
+    h.arm_flag_drift_check({"cam1", "cam2"});
+    const auto r = h.check_flag_drift_for_testing();
+    assert(r == WedgeHealer::Reason::kFlagDrift);
+    assert(seen_ids.size() == 2);
+    assert(cmds.empty());  // suppressed by warmup
+
+    // Suppressed by a safeguard -> must have re-armed with the drifting
+    // subset so the restart isn't lost.  Second check sees only cam2.
+    seen_ids.clear();
+    const auto r2 = h.check_flag_drift_for_testing();
+    assert(r2 == WedgeHealer::Reason::kFlagDrift);
+    assert(seen_ids.size() == 1 && seen_ids[0] == "cam2");
+  }
+
+  // Case 9: arming twice before the check runs merges both ID sets
+  // rather than dropping the first.
+  {
+    WedgeHealer h;
+    std::vector<std::string> seen_ids;
+    h.set_exec_fn([&](const std::string&) { return 0; });
+    h.set_flag_drift_fn([&](const std::vector<std::string>& ids) {
+      seen_ids = ids;
+      return std::vector<std::string>{};
+    });
+    h.arm_flag_drift_check({"cam1"});
+    h.arm_flag_drift_check({"cam2", "cam1"});  // cam1 must not duplicate
+    h.check_flag_drift_for_testing();
+    assert(seen_ids.size() == 2);
+  }
+
+  // Case 10: the drift check is one-shot -- after it runs and finds
+  // nothing, a second call does nothing until re-armed.
+  {
+    WedgeHealer h;
+    int calls = 0;
+    h.set_exec_fn([&](const std::string&) { return 0; });
+    h.set_flag_drift_fn([&](const std::vector<std::string>&) {
+      ++calls;
+      return std::vector<std::string>{};
+    });
+    h.arm_flag_drift_check({"cam1"});
+    h.check_flag_drift_for_testing();
+    h.check_flag_drift_for_testing();
+    assert(calls == 1);
+  }
+
   std::printf("test_wedge_healer: OK\n");
   return 0;
 }

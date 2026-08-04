@@ -282,6 +282,13 @@ size_t AlarmNotifier::write_cb(char* ptr, size_t size, size_t nmemb,
   return size * nmemb;
 }
 
+std::string AlarmNotifier::protect_api_get(const std::string& url,
+                                            const std::string& user_id) {
+  std::string body;
+  AlarmNotifier::perform_get(url, user_id, &body);
+  return body;
+}
+
 long AlarmNotifier::perform_get(const std::string& url,  // NOLINT(runtime/int)
                                  const std::string& user_id,
                                  std::string* body) {

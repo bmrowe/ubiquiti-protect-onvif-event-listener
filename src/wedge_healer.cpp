@@ -12,6 +12,7 @@
 
 #include "wedge_healer.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <mutex>  // NOLINT(build/c++11)
 #include <string>
@@ -30,11 +31,18 @@ constexpr const char* kRestartCmdDbWedge = "systemctl restart msp.service msr.se
 // disruptive service to bounce and playback stays functional.
 constexpr const char* kRestartCmdMsrWedge = "systemctl restart msr.service";
 
+// featureFlags drift is a Protect-process problem only -- msp/msr hold no
+// camera capability state, so bouncing them would add downtime for
+// nothing.  Field-confirmed on issue #34: restarting unifi-protect alone
+// clears the stale in-memory flags in ~90 s.
+constexpr const char* kRestartCmdFlagDrift = "systemctl restart unifi-protect.service";  // NOLINT(whitespace/line_length)
+
 const char* reason_str(WedgeHealer::Reason r) {
   switch (r) {
-    case WedgeHealer::Reason::kDbWedge:  return "DB";
-    case WedgeHealer::Reason::kMsrWedge: return "MSR";
-    default:                             return "none";
+    case WedgeHealer::Reason::kDbWedge:   return "DB";
+    case WedgeHealer::Reason::kMsrWedge:  return "MSR";
+    case WedgeHealer::Reason::kFlagDrift: return "featureFlags-drift";
+    default:                              return "none";
   }
 }
 
@@ -98,38 +106,47 @@ WedgeHealer::Reason WedgeHealer::decide_wedge(
   return Reason::kNone;
 }
 
-void WedgeHealer::fire_restart(Reason r) {
+bool WedgeHealer::fire_restart(Reason r) {
   const auto now = std::chrono::steady_clock::now();
   const int64_t warmup_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
       now - boot_).count();
   if (warmup_ms < kWarmupSec * 1000LL) {
     LOG(WARNING) << "[healer] " << reason_str(r)
-                 << " wedge detected but suppressed (warmup, "
+                 << " trigger detected but suppressed (warmup, "
                  << warmup_ms / 1000 << "s < " << kWarmupSec << "s)";
-    return;
+    return false;
   }
   if (last_restart_ != std::chrono::steady_clock::time_point{}) {
     const int64_t since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         now - last_restart_).count();
     if (since_ms < kCooldownSec * 1000LL) {
       LOG(WARNING) << "[healer] " << reason_str(r)
-                   << " wedge detected but suppressed (cooldown, "
+                   << " trigger detected but suppressed (cooldown, "
                    << since_ms / 1000 << "s < " << kCooldownSec << "s)";
-      return;
+      return false;
     }
   }
   if (restart_count_.load() >= kMaxPerDay) {
     LOG(WARNING) << "[healer] " << reason_str(r)
-                 << " wedge detected but suppressed (24 h cap reached: "
+                 << " trigger detected but suppressed (24 h cap reached: "
                  << restart_count_.load() << "/" << kMaxPerDay << ")";
-    return;
+    return false;
   }
 
-  const std::string cmd = (r == Reason::kDbWedge)
-      ? kRestartCmdDbWedge : kRestartCmdMsrWedge;
-  LOG(ERROR) << "[healer] " << reason_str(r)
-             << " wedged for >" << kWindowSec
-             << "s -- running: " << cmd;
+  const char* cmd_c = kRestartCmdMsrWedge;
+  if (r == Reason::kDbWedge)        cmd_c = kRestartCmdDbWedge;
+  else if (r == Reason::kFlagDrift) cmd_c = kRestartCmdFlagDrift;
+  const std::string cmd = cmd_c;
+  if (r == Reason::kFlagDrift) {
+    LOG(ERROR) << "[healer] " << reason_str(r)
+               << ": Protect still reports stale featureFlags "
+               << kFlagDriftGraceSec
+               << "s after we wrote them -- running: " << cmd;
+  } else {
+    LOG(ERROR) << "[healer] " << reason_str(r)
+               << " wedged for >" << kWindowSec
+               << "s -- running: " << cmd;
+  }
   const int rc = exec_ ? exec_(cmd) : -1;
   if (rc != 0) {
     LOG(ERROR) << "[healer] restart exit code " << rc
@@ -145,6 +162,64 @@ void WedgeHealer::fire_restart(Reason r) {
     if (history_.size() > static_cast<size_t>(kMaxPerDay))
       history_.erase(history_.begin());
   }
+  return true;
+}
+
+void WedgeHealer::arm_flag_drift_check(
+    const std::vector<std::string>& camera_ids) {
+  if (camera_ids.empty()) return;
+  std::lock_guard<std::mutex> lk(drift_mu_);
+  // Merge rather than replace: a second write landing inside the grace
+  // window must not drop the cameras the first write was waiting on.
+  for (const auto& id : camera_ids) {
+    if (std::find(drift_camera_ids_.begin(), drift_camera_ids_.end(), id) ==
+        drift_camera_ids_.end()) {
+      drift_camera_ids_.push_back(id);
+    }
+  }
+  // Restart the grace clock so the check runs a full window after the
+  // most recent write, giving Protect the best chance to catch up on
+  // its own before we conclude it never will.
+  drift_armed_at_ = std::chrono::steady_clock::now();
+}
+
+WedgeHealer::Reason WedgeHealer::maybe_check_flag_drift(bool force) {
+  std::vector<std::string> ids;
+  {
+    std::lock_guard<std::mutex> lk(drift_mu_);
+    if (drift_armed_at_ == std::chrono::steady_clock::time_point{})
+      return Reason::kNone;  // nothing armed
+    if (!force) {
+      const int64_t waited_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now() - drift_armed_at_).count();
+      if (waited_ms < kFlagDriftGraceSec * 1000LL) return Reason::kNone;
+    }
+    ids.swap(drift_camera_ids_);
+    drift_armed_at_ = {};  // one-shot: disarm regardless of outcome
+  }
+  if (ids.empty() || !flag_drift_) return Reason::kNone;
+
+  const std::vector<std::string> drifted = flag_drift_(ids);
+  if (drifted.empty()) {
+    LOG(INFO) << "[healer] featureFlags verified in Protect for "
+              << ids.size() << " camera(s); no drift";
+    return Reason::kNone;
+  }
+  LOG(WARNING) << "[healer] " << drifted.size() << " of " << ids.size()
+               << " camera(s) still show stale featureFlags in Protect "
+               << "after " << kFlagDriftGraceSec << "s";
+  if (!fire_restart(Reason::kFlagDrift)) {
+    // A safeguard declined this one (most often warmup -- the common
+    // path is an admin-UI toggle, which restarts *us*, so our own
+    // uptime is near zero exactly when the drift appears).  Re-arm with
+    // the cameras that are still drifting so the restart happens as
+    // soon as it is permitted instead of being lost.
+    std::lock_guard<std::mutex> lk(drift_mu_);
+    drift_camera_ids_ = drifted;
+    drift_armed_at_ = std::chrono::steady_clock::now();
+  }
+  return Reason::kFlagDrift;
 }
 
 WedgeHealer::Reason WedgeHealer::tick_for_testing(
@@ -155,6 +230,10 @@ WedgeHealer::Reason WedgeHealer::tick_for_testing(
                                  db_ms_since_timeout, msr);
   if (r != Reason::kNone) fire_restart(r);
   return r;
+}
+
+WedgeHealer::Reason WedgeHealer::check_flag_drift_for_testing() {
+  return maybe_check_flag_drift(/*force=*/true);
 }
 
 void WedgeHealer::run() {
@@ -172,7 +251,11 @@ void WedgeHealer::run() {
     const int64_t db_ms_success = pg::MsSinceLastSuccess();
     const int64_t db_ms_timeout = pg::MsSinceLastTimeout();
     const Reason r = decide_wedge(db_ms_success, db_ms_timeout, msr);
-    if (r != Reason::kNone) fire_restart(r);
+    if (r != Reason::kNone) {
+      fire_restart(r);
+      continue;  // one action per tick
+    }
+    maybe_check_flag_drift(/*force=*/false);
   }
 }
 

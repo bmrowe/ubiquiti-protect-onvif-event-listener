@@ -1282,12 +1282,81 @@ int main(int argc, char* argv[]) {
       return onvif::WedgeHealer::MsrSnapshot{
           s.total_ok, s.total_fail, s.ms_since_ok, s.ms_since_fail};
     });
+    // featureFlags drift check: compare what we wrote into Postgres
+    // against what Protect reports through its own API.  A long-running
+    // Protect process never re-reads the cameras row, so our writes can
+    // be correct in the DB while Protect's in-memory model still says the
+    // camera can't smart-detect -- and it then filters our
+    // smartDetectZone events out of the UI (issue #34).
+    const std::string protect_url_for_drift =
+        absl::GetFlag(FLAGS_protect_url);
+    healer->set_flag_drift_fn(
+        [protect_url_for_drift, &protect_user_id_provider, cam_db](
+            const std::vector<std::string>& ids)
+            -> std::vector<std::string> {
+      std::vector<std::string> drifted;
+      if (protect_url_for_drift.empty()) return drifted;
+      const std::string user_id = protect_user_id_provider.current();
+      if (user_id.empty()) return drifted;
+
+      auto db_or = unifi::read_smart_detect_flags(ids, cam_db);
+      if (!db_or.ok()) {
+        LOG(WARNING) << "[healer] drift check: " << db_or.status().message();
+        return drifted;
+      }
+      for (const auto& [cam_id, db_json] : *db_or) {
+        // We only care about cameras we actually enabled.  An empty
+        // array in the DB means we never pinned this one, so there is
+        // nothing for Protect to be stale about.
+        if (db_json.empty() || db_json == "[]") continue;
+        const std::string body = onvif::AlarmNotifier::protect_api_get(
+            protect_url_for_drift + "/api/cameras/" + cam_id, user_id);
+        if (body.empty()) continue;  // API unreachable; not evidence of drift
+        // Protect echoes featureFlags in the camera object.  Comparing
+        // for the presence of a non-empty smartDetectTypes array is
+        // enough: the drift we are hunting is [] in Protect vs
+        // ["person","vehicle"] in Postgres.
+        const size_t k = body.find("\"smartDetectTypes\"");
+        if (k == std::string::npos) continue;
+        const size_t lb = body.find('[', k);
+        const size_t rb = (lb == std::string::npos)
+                              ? std::string::npos : body.find(']', lb);
+        if (lb == std::string::npos || rb == std::string::npos) continue;
+        const std::string api_arr = body.substr(lb, rb - lb + 1);
+        bool api_empty = true;
+        for (size_t i = 1; i + 1 < api_arr.size(); ++i) {
+          if (!std::isspace(static_cast<unsigned char>(api_arr[i]))) {
+            api_empty = false;
+            break;
+          }
+        }
+        if (api_empty) {
+          LOG(WARNING) << "[healer] camera " << cam_id
+                       << " featureFlags drift: postgres=" << db_json
+                       << " protect=" << api_arr;
+          drifted.push_back(cam_id);
+        }
+      }
+      return drifted;
+    });
     healer->start();
     LOG(INFO) << "[healer] auto-heal enabled (window="
               << onvif::WedgeHealer::kWindowSec << "s, warmup="
               << onvif::WedgeHealer::kWarmupSec << "s, cooldown="
               << onvif::WedgeHealer::kCooldownSec << "s, cap="
               << onvif::WedgeHealer::kMaxPerDay << "/24h)";
+    // Arm the drift check for every camera we just pinned flags on at
+    // start-up.  This is the exact path in issue #34: the user toggles
+    // first-party smart support in the admin UI, which restarts *us*,
+    // we write featureFlags into Postgres -- and a Protect that has
+    // been up for days never re-reads them.
+    if (!first_party_managed_ids.empty()) {
+      healer->arm_flag_drift_check(
+          std::vector<std::string>(first_party_managed_ids.begin(),
+                                    first_party_managed_ids.end()));
+      LOG(INFO) << "[healer] armed featureFlags drift check for "
+                << first_party_managed_ids.size() << " first-party camera(s)";
+    }
   } else {
     LOG(INFO) << "[healer] auto-heal disabled (--auto_heal_protect=false)";
   }

@@ -321,12 +321,19 @@ absl::Status EnrichRestored(PGconn* conn, EnrichOptions opts) {
         util::now_ms() - 30ULL * 86'400'000ULL;
     const std::string floor_str = std::to_string(floor_ms);
     const char* select_params[] = { limit_str.c_str(), floor_str.c_str() };
-    // Explicit per-query timeout: 3x the batch target gives generous
-    // headroom over expected duration but still fails fast if the DB
-    // is wedged.  Passing an explicit value here bypasses the pg_util
-    // 60 s default that killed the pre-batched version.
-    const int select_timeout_ms =
-        static_cast<int>(opts.target_batch_ms.count()) * 3;
+    // Per-query timeout.  3x the batch target is the steady-state
+    // budget, floored at kSelectFloorMs because the *first* batch is
+    // the expensive one: the WHERE clause has to walk past every
+    // already-enriched event in the window (evaluating jsonb_path_exists
+    // per row) before it can fill a single LIMIT page.  A 6 s budget
+    // reliably lost that race on busy consoles -- issue #34's dump logs
+    // this timeout on every single start-up, meaning enrichment never
+    // ran there at all.  Enrich is a background job with a 50 % duty
+    // cycle between batches, so a longer ceiling costs Protect nothing.
+    constexpr int kSelectFloorMs = 30'000;
+    const int select_timeout_ms = std::max(
+        kSelectFloorMs,
+        static_cast<int>(opts.target_batch_ms.count()) * 3);
     PGresult* r = onvif::pg::ExecParamsWithTimeout(
         conn, select_timeout_ms, select_events, 2,
         nullptr, select_params, nullptr, nullptr, 0);
