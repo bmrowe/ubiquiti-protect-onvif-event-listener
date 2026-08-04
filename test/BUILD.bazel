@@ -139,6 +139,22 @@ filegroup(
     srcs = ["testdata/hikvision_pullpoint_notauthorized.jsonl"],
 )
 
+# Dahua-family IVS camera: line crossing + field detector, both carrying
+# the ONVIF ClassTypes object class, plus a firmware-mangled
+# "tns1:RuleEngine/tt:CellMotionDetector" topic.  Captured from a user's
+# console for issue #45.
+filegroup(
+    name = "dahua_ivs_linecross_raw_log",
+    srcs = ["testdata/dahua_ivs_linecross_20260726.jsonl"],
+)
+
+# Reolink AI doorbell: the full MyRuleDetector family in one capture --
+# People / Vehicle / Face / DogCat / Visitor / Package.
+filegroup(
+    name = "reolink_ai_doorbell_raw_log",
+    srcs = ["testdata/reolink_ai_doorbell_20260725.jsonl"],
+)
+
 cc_test(
     name = "test_onvif_listener",
     srcs = ["test_onvif_listener.cpp"],
@@ -160,6 +176,8 @@ cc_test(
         "$(location //test:unvr_1_47_raw_log)",
         "$(location //test:reolink_bullet_raw_log)",
         "$(location //test:hikvision_pullpoint_notauthorized_raw_log)",
+        "$(location //test:dahua_ivs_linecross_raw_log)",
+        "$(location //test:reolink_ai_doorbell_raw_log)",
     ],
     data = [
         "//test:tsan_suppressions",
@@ -179,6 +197,8 @@ cc_test(
         "//test:unvr_1_47_raw_log",
         "//test:reolink_bullet_raw_log",
         "//test:hikvision_pullpoint_notauthorized_raw_log",
+        "//test:dahua_ivs_linecross_raw_log",
+        "//test:reolink_ai_doorbell_raw_log",
     ],
     deps = [
         "//:onvif_listener",

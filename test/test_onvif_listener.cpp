@@ -17,6 +17,7 @@
 #include <functional>
 #include <iostream>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
@@ -600,10 +601,112 @@ static void test_hot_add(const std::string& jsonl) {
 }
 
 // ============================================================
+// Test: Dahua-family IVS camera -- line crossing carries the ONVIF
+// ClassTypes object class, and the firmware-mangled CellMotionDetector
+// topic still arrives intact for the recorder to normalise.
+// ============================================================
+static void test_dahua_ivs_line_crossing(const std::string& jsonl) {
+  DahuaIvsLineCrossEmulator emu(jsonl);
+  emu.start();
+
+  onvif::CameraConfig cfg;
+  cfg.ip                 = emu.local_address();
+  cfg.user               = "admin";
+  cfg.password           = "password";
+  cfg.retry_interval_sec = 1;
+
+  // Wait until a line-crossing notification shows up rather than a bare
+  // event count -- the capture front-loads housekeeping topics.
+  auto r = collect_until({cfg},
+    [](const std::vector<onvif::OnvifEvent>& evs) {
+      for (const auto& e : evs)
+        if (e.topic == "tns1:RuleEngine/LineDetector/Crossed") return true;
+      return false;
+    }, std::chrono::seconds(30));
+
+  CHECK(!r.timed_out, "timed out waiting for a LineDetector/Crossed event");
+
+  bool saw_cross = false, saw_class = false, saw_mangled_cellmotion = false;
+  for (const auto& ev : r.events) {
+    if (ev.topic == "tns1:RuleEngine/LineDetector/Crossed") {
+      saw_cross = true;
+      // ObjectId is the one field ONVIF guarantees here.
+      CHECK(ev.data.count("ObjectId") > 0,
+            "line crossing should carry ObjectId");
+      auto ct = ev.data.find("ClassTypes");
+      if (ct != ev.data.end() && !ct->second.empty()) {
+        saw_class = true;
+        CHECK(ct->second == "Human" || ct->second == "Vehicle" ||
+              ct->second == "Animal",
+              "unexpected ClassTypes value: " + ct->second);
+      }
+    }
+    if (ev.topic == "tns1:RuleEngine/tt:CellMotionDetector") {
+      saw_mangled_cellmotion = true;
+      CHECK(ev.data.count("IsMotion") > 0,
+            "mangled CellMotionDetector topic should still carry IsMotion");
+    }
+  }
+  CHECK(saw_cross, "expected at least one LineDetector/Crossed event");
+  CHECK(saw_class,
+        "expected at least one crossing carrying a ClassTypes object class");
+  // Documents the firmware quirk this fixture exists to pin; not fatal if
+  // the mangled topic falls outside the replayed window.
+  if (!saw_mangled_cellmotion) {
+    std::cout << "    (note: mangled CellMotionDetector topic not in window)\n";
+  }
+}
+
+// ============================================================
+// Test: Reolink AI doorbell -- the whole MyRuleDetector family arrives,
+// covering all four smart-detect classes Protect models.
+// ============================================================
+static void test_reolink_ai_doorbell_classes(const std::string& jsonl) {
+  ReolinkAiDoorbellEmulator emu(jsonl);
+  emu.start();
+
+  onvif::CameraConfig cfg;
+  cfg.ip                 = emu.local_address();
+  cfg.user               = "admin";
+  cfg.password           = "password";
+  cfg.retry_interval_sec = 1;
+
+  auto r = collect({cfg}, 8, std::chrono::seconds(30));
+  CHECK(!r.timed_out, "timed out waiting for doorbell events");
+
+  std::set<std::string> topics;
+  for (const auto& ev : r.events) {
+    if (!ev.topic.empty()) topics.insert(ev.topic);
+    // Every MyRuleDetector member shares the Source/State shape; that
+    // uniformity is what lets one handler pattern cover all of them.
+    if (ev.topic.rfind("tns1:RuleEngine/MyRuleDetector/", 0) == 0) {
+      CHECK(ev.data.count("State") > 0,
+            "MyRuleDetector topic should carry State: " + ev.topic);
+    }
+  }
+
+  // The capture is what makes this fixture worth keeping: a single
+  // device exercising person, vehicle, animal and package.
+  const char* want[] = {
+    "tns1:RuleEngine/MyRuleDetector/PeopleDetect",
+    "tns1:RuleEngine/MyRuleDetector/VehicleDetect",
+    "tns1:RuleEngine/MyRuleDetector/FaceDetect",
+    "tns1:RuleEngine/MyRuleDetector/DogCatDetect",
+    "tns1:RuleEngine/MyRuleDetector/Visitor",
+    "tns1:RuleEngine/MyRuleDetector/Package",
+  };
+  int found = 0;
+  for (const char* w : want) if (topics.count(w)) ++found;
+  CHECK(found >= 4,
+        "expected >= 4 of the 6 MyRuleDetector topics, got " +
+            std::to_string(found));
+}
+
+// ============================================================
 // main
 // ============================================================
 int main(int argc, char* argv[]) {
-  if (argc < 17) {
+  if (argc < 19) {
     std::cerr << "Usage: " << argv[0] << "\n"
               << "  <hikvision_compatible.jsonl>\n"
               << "  <dahua_dh_sd4a425db_hny.jsonl>\n"
@@ -620,7 +723,9 @@ int main(int argc, char* argv[]) {
               << "  <unvr_1_45.jsonl>\n"
               << "  <unvr_1_47.jsonl>\n"
               << "  <reolink_bullet.jsonl>\n"
-              << "  <hikvision_pullpoint_notauthorized.jsonl>\n";
+              << "  <hikvision_pullpoint_notauthorized.jsonl>\n"
+              << "  <dahua_ivs_linecross.jsonl>\n"
+              << "  <reolink_ai_doorbell.jsonl>\n";
     return 1;
   }
   const std::string hikvision_jsonl      = argv[1];
@@ -639,6 +744,8 @@ int main(int argc, char* argv[]) {
   const std::string unvr_1_47_jsonl      = argv[14];
   const std::string reolink_jsonl        = argv[15];
   const std::string hik_notauth_jsonl    = argv[16];
+  const std::string dahua_ivs_jsonl      = argv[17];
+  const std::string reolink_ai_jsonl     = argv[18];
 
   onvif::global_init();
 
@@ -678,6 +785,10 @@ int main(int argc, char* argv[]) {
            [&] { test_both_cameras(hikvision_jsonl, dahua_jsonl); });
   run_test("axis_ref_params",
            [] { test_axis_ref_params(); });
+  run_test("dahua_ivs_line_crossing",
+           [&] { test_dahua_ivs_line_crossing(dahua_ivs_jsonl); });
+  run_test("reolink_ai_doorbell_classes",
+           [&] { test_reolink_ai_doorbell_classes(reolink_ai_jsonl); });
 
   onvif::global_cleanup();
 

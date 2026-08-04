@@ -93,7 +93,30 @@ bool is_known_non_detection_topic(const std::string& topic) {
   for (const char* p : kPrefixes) {
     if (topic.rfind(p, 0) == 0) return true;
   }
-  return false;
+  // Some firmware emits a bare "tns1:Device" with a single "device"
+  // field as a keepalive.  Not a detection, and not worth a warning.
+  return topic == "tns1:Device";
+}
+
+// Map an ONVIF tt:ClassType token to our internal detection type.
+// Returns empty when the value is absent or something we don't model.
+//
+// ClassTypes is the ONVIF-standard object class and is far more
+// trustworthy than a vendor's Rule name -- the analytics engine that
+// tracked the object put it there.  Observed values in the field:
+// Human, Vehicle, Animal.  The spec also allows Face and LicensePlate,
+// which map onto the person class because Protect has no filter of
+// their own.
+std::string class_from_class_types(const OnvifEvent& ev) {
+  auto it = ev.data.find("ClassTypes");
+  if (it == ev.data.end() || it->second.empty()) return {};
+  const std::string& v = it->second;
+  if (v == "Vehicle")      return "vehicle";
+  if (v == "Animal")       return "animal";
+  if (v == "Human" ||
+      v == "Face"  ||
+      v == "LicensePlate") return "human";
+  return {};
 }
 
 std::optional<Detection> classify(const OnvifEvent& ev,
@@ -105,15 +128,21 @@ std::optional<Detection> classify(const OnvifEvent& ev,
     if (rule_it == ev.source.end() || inside_it == ev.data.end())
       return {};
 
+    // Prefer the ONVIF-standard ClassTypes when the camera sends it --
+    // it comes from the analytics engine that tracked the object.  Only
+    // fall back to reading the vendor Rule name when it is absent.
+    //
     // Hikvision sends the rule name in the Rule field (e.g.
     // "MyFieldDetector1") -- the camera's AcuSense classifier has
     // already filtered to human/vehicle implicitly, so fall back to the
     // default object type and let NanoDet-M refine the class on the
     // snapshot.
-    std::string type;
-    if      (rule_it->second == "Human")   type = "human";
-    else if (rule_it->second == "Vehicle") type = "vehicle";
-    else                                   type = fallback_type;
+    std::string type = class_from_class_types(ev);
+    if (type.empty()) {
+      if      (rule_it->second == "Human")   type = "human";
+      else if (rule_it->second == "Vehicle") type = "vehicle";
+      else                                   type = fallback_type;
+    }
 
     return Detection{type, inside_it->second == "true", ev.event_time};
   }
@@ -165,6 +194,23 @@ std::optional<Detection> classify(const OnvifEvent& ev,
     return Detection{"animal", it->second == "true", ev.event_time};
   }
 
+  // --- Reolink doorbell: visitor at the door (MyRuleDetector) ---
+  // Doorbell-specific "someone is standing here" signal; a visitor is a
+  // person as far as Protect's smart-detect classes go.
+  if (ev.topic == "tns1:RuleEngine/MyRuleDetector/Visitor") {
+    auto it = ev.data.find("State");
+    if (it == ev.data.end()) return {};
+    return Detection{"human", it->second == "true", ev.event_time};
+  }
+
+  // --- Reolink: package detection (MyRuleDetector) ---
+  // Maps straight onto Protect's own "package" smart-detect class.
+  if (ev.topic == "tns1:RuleEngine/MyRuleDetector/Package") {
+    auto it = ev.data.find("State");
+    if (it == ev.data.end()) return {};
+    return Detection{"package", it->second == "true", ev.event_time};
+  }
+
   // --- IVS line crossing (Dahua and compatibles) ---
   // Momentary: the camera reports the instant an object crossed the line
   // and never sends a matching "ended" notification, so there is no
@@ -180,15 +226,27 @@ std::optional<Detection> classify(const OnvifEvent& ev,
     // just happened -- so acting on it would invent an event on every
     // reconnect.
     if (ev.property_op == "Initialized") return {};
-    return Detection{fallback_type, /*started=*/true, ev.event_time,
-                     /*from_fallback=*/true, /*momentary=*/true};
+    // Field captures show this topic carrying ClassTypes (Human /
+    // Vehicle / Animal) alongside ObjectId, so we usually get a real
+    // class straight from the camera.  Only when it's missing do we
+    // fall back and let NanoDet-M infer from the snapshot.
+    const std::string cls = class_from_class_types(ev);
+    return Detection{cls.empty() ? fallback_type : cls,
+                     /*started=*/true, ev.event_time,
+                     /*from_fallback=*/cls.empty(), /*momentary=*/true};
   }
 
   // --- Generic CellMotionDetector/Motion (Amcrest, Lorex, Dahua, etc.) ---
   // Basic pixel-change motion; no object class from ONVIF.  Uses fallback_type
   // unless NanoDet-M (--detect / --detect_override) infers a class from the
   // snapshot — marked from_fallback=true so on_event() can apply that override.
-  if (ev.topic == "tns1:RuleEngine/CellMotionDetector/Motion") {
+  // The second spelling is a firmware bug seen in the field: the camera
+  // leaks the tt: schema prefix into the topic path and truncates the
+  // trailing /Motion, emitting "tns1:RuleEngine/tt:CellMotionDetector".
+  // The payload is identical (IsMotion), so treat it as the same topic
+  // rather than making the user chase a malformed string.
+  if (ev.topic == "tns1:RuleEngine/CellMotionDetector/Motion" ||
+      ev.topic == "tns1:RuleEngine/tt:CellMotionDetector") {
     auto it = ev.data.find("IsMotion");
     if (it == ev.data.end()) return {};
     return Detection{fallback_type, it->second == "true", ev.event_time, true};
@@ -1388,10 +1446,13 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
          ev.topic == "tns1:RuleEngine/MyRuleDetector/VehicleDetect" ||
          ev.topic == "tns1:RuleEngine/MyRuleDetector/FaceDetect"    ||
          ev.topic == "tns1:RuleEngine/MyRuleDetector/DogCatDetect"  ||
+         ev.topic == "tns1:RuleEngine/MyRuleDetector/Visitor"       ||
+         ev.topic == "tns1:RuleEngine/MyRuleDetector/Package"       ||
          ev.topic == "tns1:RuleEngine/LineDetector/Crossed") &&
         ev.property_op != "Initialized") {
       ai_capable_cameras_.insert(ev.camera_ip);
-    } else if (ev.topic == "tns1:RuleEngine/CellMotionDetector/Motion" &&
+    } else if ((ev.topic == "tns1:RuleEngine/CellMotionDetector/Motion" ||
+                ev.topic == "tns1:RuleEngine/tt:CellMotionDetector") &&
                ev.property_op != "Initialized") {
       if (ai_capable_cameras_.count(ev.camera_ip)) return;
       cell_motion_cameras_.insert(ev.camera_ip);
