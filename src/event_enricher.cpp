@@ -173,6 +173,16 @@ std::string BuildEnrichedMetadata(const EventInput& ev) {
   Json j;
   j.object_open();
 
+  // Marks the event as ours.  Six queries across motion_poller and
+  // detection_recorder filter on metadata->>'source' = 'onvif-recorder'
+  // to tell our rows from Protect's own -- the high-water-mark init and
+  // the orphan purges among them.  The legacy sparse-metadata path has
+  // always written it, but this rich path (Protect 7.1+) did not, so on
+  // every modern install those queries silently matched nothing: the
+  // per-camera hwm fell back to (now - 1h) on every start, and the
+  // purges only ever covered third-party cameras via their other branch.
+  j.key("source").val_str("onvif-recorder");
+
   j.key("count").val_null();
 
   // ---- detectedAreas ----

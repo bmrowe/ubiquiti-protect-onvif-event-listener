@@ -170,6 +170,33 @@ void test_metadata_multi_object_emits_one_entry_per_object() {
 
 }  // namespace
 
+
+// Six queries across motion_poller and detection_recorder identify our
+// rows by metadata->>'source'.  The rich path omitted it for the whole of
+// Protect 7.1+, so the per-camera high-water mark silently fell back to
+// (now - 1h) on every start and the orphan purges only ever matched
+// third-party cameras.  Nothing failed loudly -- pin it.
+static void test_metadata_carries_source_tag() {
+  onvif::enricher::EventInput ev;
+  ev.event_id = "evt-src";
+  ev.camera_id = "cam-src";
+  ev.event_type = "smartDetectZone";
+  ev.smart_detect_types = {"person"};
+  ev.start_ms = 1779465293952ULL;
+  ev.end_ms = 1779465312040ULL;
+  ev.image_width = 2560;
+  ev.image_height = 1440;
+  ev.object_ids = {"obj-uuid-1"};
+
+  std::string md = onvif::enricher::BuildEnrichedMetadata(ev);
+  CHECK_CONTAINS(md, "\"source\":\"onvif-recorder\"");
+
+  // Also true with no objects -- the tag is about provenance, not content.
+  ev.object_ids.clear();
+  std::string empty_md = onvif::enricher::BuildEnrichedMetadata(ev);
+  CHECK_CONTAINS(empty_md, "\"source\":\"onvif-recorder\"");
+}
+
 int main() {
   test_placeholder_bbox_person();
   test_placeholder_bbox_vehicle();
@@ -177,6 +204,7 @@ int main() {
   test_full_grid_area_indexes();
   test_smart_detect_object_attributes_person();
   test_metadata_has_seven_top_level_keys();
+  test_metadata_carries_source_tag();
   test_metadata_with_no_objects_has_empty_arrays();
   test_metadata_multi_object_emits_one_entry_per_object();
   std::printf("event_enricher tests passed\n");
