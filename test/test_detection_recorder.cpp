@@ -2312,6 +2312,94 @@ static void test_class_types_mapping() {
         "unknown ClassTypes should still record via the fallback type");
 }
 
+static void test_drop_unclassified_motion(const std::string& ubv_dir) {
+  // Part 1: generic motion is dropped.
+  {
+    auto backend = std::make_unique<MockBackend>();
+    MockBackend* bptr = backend.get();
+    auto rec_or =
+        onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+    CHECK(rec_or.ok(), "drop_unclassified: CreateWithBackend failed");
+    onvif::DetectionRecorder& recorder = **rec_or;
+    recorder.set_ubv_dir(ubv_dir);
+    recorder.set_drop_unclassified_motion(true);
+
+    auto jpeg = load_file(source_dir() + "testdata/snapshot_108.jpg");
+    SnapshotSyntheticEmulator emu("192.168.1.211",
+      {make_cell_motion_response(true,  "2026-03-24T10:00:00Z"),
+       make_cell_motion_response(false, "2026-03-24T10:00:05Z")},
+      jpeg);
+    emu.start();
+
+    bool ok = run_single_camera(emu, recorder, 2);
+    CHECK(ok, "drop_unclassified: timed out (motion)");
+    int events = static_cast<int>(bptr->events.size());
+    CHECK(events == 0,
+          "drop_unclassified: expected 0 events for unclassified motion, got "
+          + std::to_string(events));
+  }
+
+  // Part 2: a real AI event (human -> person) is still recorded.
+  {
+    auto backend = std::make_unique<MockBackend>();
+    MockBackend* bptr = backend.get();
+    auto rec_or =
+        onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+    CHECK(rec_or.ok(), "drop_unclassified: CreateWithBackend failed (ai)");
+    onvif::DetectionRecorder& recorder = **rec_or;
+    recorder.set_ubv_dir(ubv_dir);
+    recorder.set_drop_unclassified_motion(true);
+
+    auto jpeg = load_file(source_dir() + "testdata/snapshot_108.jpg");
+    SnapshotSyntheticEmulator emu("192.168.1.212",
+      {make_human_shape_response(true,  "2026-03-24T10:01:00Z"),
+       make_human_shape_response(false, "2026-03-24T10:01:05Z")},
+      jpeg);
+    emu.start();
+
+    bool ok = run_single_camera(emu, recorder, 2);
+    CHECK(ok, "drop_unclassified: timed out (ai)");
+    int events = static_cast<int>(bptr->events.size());
+    CHECK(events == 1,
+          "drop_unclassified: expected AI event recorded, got "
+          + std::to_string(events));
+    int person_sdo = 0;
+    for (auto& s : bptr->sdos) if (s.obj_type == "person") ++person_sdo;
+    CHECK(person_sdo == 1,
+          "drop_unclassified: expected 1 person SDO, got "
+          + std::to_string(person_sdo));
+  }
+}
+
+// The momentary exemption: a line crossing is a deliberate analytic trip,
+// not pixel noise, so --drop_unclassified_motion must not discard it even
+// when the camera sends no ClassTypes and NanoDet-M isn't available.
+static void test_drop_unclassified_spares_line_crossing() {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  CHECK(rec_or.ok(), "drop_unclassified/momentary: CreateWithBackend failed");
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_drop_unclassified_motion(true);
+  recorder.set_coalesce_window(0);
+
+  onvif::OnvifEvent ev;
+  ev.camera_ip   = "192.168.1.213";
+  ev.topic       = "tns1:RuleEngine/LineDetector/Crossed";
+  ev.event_time  = "2026-03-24T10:02:00Z";
+  ev.property_op = "Changed";
+  ev.data["ObjectId"] = "3";          // no ClassTypes -> from_fallback
+  recorder.on_event(ev);
+
+  CHECK(bptr->events.size() == 1,
+        "line crossing must survive --drop_unclassified_motion, got " +
+            std::to_string(bptr->events.size()));
+  // The complementary case -- generic motion actually being dropped -- is
+  // covered by test_drop_unclassified_motion, which drives a camera
+  // emulator so the snapshot/NanoDet path the drop hangs off is exercised.
+}
+
+
 static void test_coalesce_window() {
   auto backend = std::make_unique<MockBackend>();
   MockBackend* bptr = backend.get();
@@ -2963,6 +3051,10 @@ int main() {
   run_test("alt_port_camera",            [&] { test_alt_port_camera(ubv_dir); });
   run_test("unhandled_topic_records_nothing",
            [] { test_unhandled_topic_records_nothing(); });
+  run_test("drop_unclassified_motion",
+           [&] { test_drop_unclassified_motion(ubv_dir); });
+  run_test("drop_unclassified_spares_line_crossing",
+           [] { test_drop_unclassified_spares_line_crossing(); });
   run_test("class_types_mapping",
            [] { test_class_types_mapping(); });
   run_test("line_crossing_synthetic_duration",

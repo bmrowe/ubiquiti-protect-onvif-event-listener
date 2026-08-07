@@ -49,6 +49,13 @@ const std::vector<Entry>& Schema() {
      "Seconds of padding added after a detection's end time.  Raise it if "
      "clips cut off before the subject has left frame.",
      "Detection"},
+    {"drop_unclassified_motion", Type::Bool,
+     "Drop generic motion events with no ONVIF class that NanoDet-M cannot "
+     "classify, instead of recording them as default_object_type.  Camera AI "
+     "events (Person/Vehicle/Pet), per-camera overrides and momentary topics "
+     "such as line crossing are unaffected.  Cuts false-positive clutter from "
+     "AI cameras (e.g. Reolink) that also emit noisy basic-motion events.",
+     "Detection"},
     {"momentary_event_sec", Type::Int,
      "Synthetic duration for momentary ONVIF events -- topics that fire "
      "once and never report an end, of which IVS line crossing is the "

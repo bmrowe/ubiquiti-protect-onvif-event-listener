@@ -350,6 +350,14 @@ ABSL_FLAG(bool, auto_heal_protect, true,
     "restarts per 24 h. Every restart is logged at ERROR level and "
     "surfaced on the admin page's Recent errors card. Set to false to "
     "disable and rely on the user to restart Protect manually.");
+ABSL_FLAG(bool, drop_unclassified_motion, false,
+    "Drop generic motion events (CellMotionDetector, VideoSource/MotionAlarm) "
+    "that carry no ONVIF object class and that NanoDet-M cannot classify, "
+    "instead of recording them as --default_object_type. Real camera AI "
+    "events (Person/Vehicle/Pet), --camera_object_types overrides and "
+    "momentary topics such as line crossing are unaffected. Useful with "
+    "Reolink/other AI cameras that also emit noisy basic-motion events. "
+    "Default false.");
 ABSL_FLAG(bool, motion_push, true,
     "Reactive motion polling via Postgres LISTEN/NOTIFY. When true "
     "(default), motion_poller installs an AFTER-INSERT trigger on the "
@@ -792,6 +800,8 @@ int main(int argc, char* argv[]) {
   onvif::DetectionRecorder& det_rec = **dr_or;
   det_rec.set_buffer(pre_buf_sec, post_buf_sec);
   det_rec.set_momentary_event_sec(momentary_sec);
+  det_rec.set_drop_unclassified_motion(
+      absl::GetFlag(FLAGS_drop_unclassified_motion));
   det_rec.set_coalesce_window(
       static_cast<uint32_t>(absl::GetFlag(FLAGS_coalesce_window_sec)));
   det_rec.set_max_events_per_hour(

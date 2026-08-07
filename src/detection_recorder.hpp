@@ -252,6 +252,16 @@ class DetectionRecorder {
   /// bounding box provided by the camera. Has no effect if no detector is set.
   void set_detect_override(bool override);
 
+  /// When true, a generic motion event (CellMotionDetector / MotionAlarm)
+  /// that carries no ONVIF class, has no per-camera type override, and that
+  /// NanoDet-M cannot classify is discarded rather than recorded as
+  /// default_object_type.  On AI cameras that already emit proper
+  /// Person/Vehicle/Pet events this removes a stream of phantom "person"
+  /// detections triggered by wind, IR and reflections.  Real camera AI
+  /// events and --camera_object_types overrides are unaffected, as are
+  /// momentary topics such as line crossing.  Default false.
+  void set_drop_unclassified_motion(bool drop);
+
   /// When enabled, thumbnail IDs use the MSR "{MAC}-{timestamp_ms}" format
   /// (length != 24) matching the native Protect convention, instead of the
   /// default 24-char hex format.  Both formats are always written to the DB
@@ -501,6 +511,7 @@ class DetectionRecorder {
   // post-buffer windows, so the recorded event spans
   //   (start - pre_buffer) .. (start + momentary + post_buffer).
   uint64_t momentary_event_ms_{4000};
+  bool     drop_unclassified_motion_{false};
 
   // Snapshot info per camera IP -- written before run(), read-only after.
   std::map<std::string, SnapshotInfo> snapshot_info_;
