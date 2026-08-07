@@ -606,7 +606,7 @@ static void test_hot_add(const std::string& jsonl) {
 // topic still arrives intact for the recorder to normalise.
 // ============================================================
 static void test_dahua_ivs_line_crossing(const std::string& jsonl) {
-  DahuaIvsLineCrossEmulator emu(jsonl);
+  ReplayCameraEmulator emu(jsonl);
   emu.start();
 
   onvif::CameraConfig cfg;
@@ -662,7 +662,7 @@ static void test_dahua_ivs_line_crossing(const std::string& jsonl) {
 // covering all four smart-detect classes Protect models.
 // ============================================================
 static void test_reolink_ai_doorbell_classes(const std::string& jsonl) {
-  ReolinkAiDoorbellEmulator emu(jsonl);
+  ReplayCameraEmulator emu(jsonl);
   emu.start();
 
   onvif::CameraConfig cfg;

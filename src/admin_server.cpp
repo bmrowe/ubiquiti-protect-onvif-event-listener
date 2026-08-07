@@ -877,25 +877,10 @@ std::optional<std::string> json_string_field_opt(const std::string& body,
   return out;
 }
 
+// Convenience wrapper: absent and empty both collapse to "".  Callers
+// that must tell those apart use json_string_field_opt directly.
 std::string json_string_field(const std::string& body, const std::string& key) {
-  const std::string needle = "\"" + key + "\"";
-  size_t p = body.find(needle);
-  if (p == std::string::npos) return {};
-  p = body.find(':', p);
-  if (p == std::string::npos) return {};
-  p = body.find('"', p);
-  if (p == std::string::npos) return {};
-  ++p;
-  std::string out;
-  while (p < body.size() && body[p] != '"') {
-    if (body[p] == '\\' && p + 1 < body.size()) {
-      out += body[p + 1];
-      p += 2;
-    } else {
-      out += body[p++];
-    }
-  }
-  return out;
+  return json_string_field_opt(body, key).value_or(std::string());
 }
 
 // Extract a boolean field.  Returns default_val if not found.

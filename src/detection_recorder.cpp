@@ -120,6 +120,50 @@ std::string class_from_class_types(const OnvifEvent& ev) {
   return {};
 }
 
+
+// The State-shaped AI topics.  Every one of these carries a single
+// data["State"] = "true"|"false" and maps to a fixed object type, so they
+// differ only in two strings -- previously eight near-identical five-line
+// blocks in classify(), plus a second copy of the same topic list in
+// on_event() for the ai_capable_cameras_ set.  Editing one list and not
+// the other silently double-counts cell motion on that camera, and no
+// test would catch it.  One table now drives both.
+struct StateTopic {
+  const char* topic;
+  const char* type;   // internal token: "human" / "vehicle" / "animal" / "package"
+};
+constexpr StateTopic kStateTopics[] = {
+  {"tns1:UserAlarm/IVA/HumanShapeDetect",          "human"},
+  {"tns1:VehicleAlarm/IVB/VehicleDetect",          "vehicle"},
+  {"tns1:RuleEngine/MyRuleDetector/PeopleDetect",  "human"},
+  {"tns1:RuleEngine/MyRuleDetector/VehicleDetect", "vehicle"},
+  // A face implies a person; Protect has no face class to filter on.
+  {"tns1:RuleEngine/MyRuleDetector/FaceDetect",    "human"},
+  // Reolink calls this "pet"; Protect's equivalent class is "animal".
+  {"tns1:RuleEngine/MyRuleDetector/DogCatDetect",  "animal"},
+  // Doorbell "someone is at the door".
+  {"tns1:RuleEngine/MyRuleDetector/Visitor",       "human"},
+  {"tns1:RuleEngine/MyRuleDetector/Package",       "package"},
+};
+
+// Topics that prove a camera does its own object classification.  Once we
+// see one, that camera's basic CellMotionDetector traffic is suppressed to
+// avoid double-counting (and PTZ-patrol false positives).
+bool is_ai_capable_topic(const std::string& topic) {
+  for (const auto& st : kStateTopics)
+    if (topic == st.topic) return true;
+  return topic == "tns1:RuleEngine/FieldDetector/ObjectsInside" ||
+         topic == "tns1:RuleEngine/LineDetector/Crossed";
+}
+
+// The two spellings of basic cell motion.  The second is a firmware bug
+// seen in the field: the camera leaks the tt: schema prefix into the topic
+// path and drops the trailing /Motion.  Payload is identical (IsMotion).
+bool is_cell_motion_topic(const std::string& topic) {
+  return topic == "tns1:RuleEngine/CellMotionDetector/Motion" ||
+         topic == "tns1:RuleEngine/tt:CellMotionDetector";
+}
+
 std::optional<Detection> classify(const OnvifEvent& ev,
                                    const std::string& fallback_type) {
   // --- Camera 108 style: FieldDetector ObjectsInside ---
@@ -148,68 +192,12 @@ std::optional<Detection> classify(const OnvifEvent& ev,
     return Detection{type, inside_it->second == "true", ev.event_time};
   }
 
-  // --- HumanShapeDetect (Hikvision knockoff / Dahua) ---
-  if (ev.topic == "tns1:UserAlarm/IVA/HumanShapeDetect") {
+  // --- State-shaped AI topics (see kStateTopics) ---
+  for (const auto& st : kStateTopics) {
+    if (ev.topic != st.topic) continue;
     auto it = ev.data.find("State");
     if (it == ev.data.end()) return {};
-    return Detection{"human", it->second == "true", ev.event_time};
-  }
-
-  // --- VehicleDetect (Hikvision knockoff / Dahua) ---
-  if (ev.topic == "tns1:VehicleAlarm/IVB/VehicleDetect") {
-    auto it = ev.data.find("State");
-    if (it == ev.data.end()) return {};
-    return Detection{"vehicle", it->second == "true", ev.event_time};
-  }
-
-  // --- Reolink: person detection (MyRuleDetector) ---
-  if (ev.topic == "tns1:RuleEngine/MyRuleDetector/PeopleDetect") {
-    auto it = ev.data.find("State");
-    if (it == ev.data.end()) return {};
-    return Detection{"human", it->second == "true", ev.event_time};
-  }
-
-  // --- Reolink: vehicle detection (MyRuleDetector) ---
-  if (ev.topic == "tns1:RuleEngine/MyRuleDetector/VehicleDetect") {
-    auto it = ev.data.find("State");
-    if (it == ev.data.end()) return {};
-    return Detection{"vehicle", it->second == "true", ev.event_time};
-  }
-
-  // --- Reolink: face detection (MyRuleDetector) ---
-  // Same Source/State shape as the People/Vehicle siblings above.  A face
-  // implies a person, so it maps to the same object type Protect shows for
-  // PeopleDetect rather than introducing a class Protect has no filter for.
-  if (ev.topic == "tns1:RuleEngine/MyRuleDetector/FaceDetect") {
-    auto it = ev.data.find("State");
-    if (it == ev.data.end()) return {};
-    return Detection{"human", it->second == "true", ev.event_time};
-  }
-
-  // --- Reolink: animal detection (MyRuleDetector) ---
-  // Reolink names this DogCatDetect; Protect's equivalent smart-detect
-  // class is the broader "animal".
-  if (ev.topic == "tns1:RuleEngine/MyRuleDetector/DogCatDetect") {
-    auto it = ev.data.find("State");
-    if (it == ev.data.end()) return {};
-    return Detection{"animal", it->second == "true", ev.event_time};
-  }
-
-  // --- Reolink doorbell: visitor at the door (MyRuleDetector) ---
-  // Doorbell-specific "someone is standing here" signal; a visitor is a
-  // person as far as Protect's smart-detect classes go.
-  if (ev.topic == "tns1:RuleEngine/MyRuleDetector/Visitor") {
-    auto it = ev.data.find("State");
-    if (it == ev.data.end()) return {};
-    return Detection{"human", it->second == "true", ev.event_time};
-  }
-
-  // --- Reolink: package detection (MyRuleDetector) ---
-  // Maps straight onto Protect's own "package" smart-detect class.
-  if (ev.topic == "tns1:RuleEngine/MyRuleDetector/Package") {
-    auto it = ev.data.find("State");
-    if (it == ev.data.end()) return {};
-    return Detection{"package", it->second == "true", ev.event_time};
+    return Detection{st.type, it->second == "true", ev.event_time};
   }
 
   // --- IVS line crossing (Dahua and compatibles) ---
@@ -246,8 +234,7 @@ std::optional<Detection> classify(const OnvifEvent& ev,
   // trailing /Motion, emitting "tns1:RuleEngine/tt:CellMotionDetector".
   // The payload is identical (IsMotion), so treat it as the same topic
   // rather than making the user chase a malformed string.
-  if (ev.topic == "tns1:RuleEngine/CellMotionDetector/Motion" ||
-      ev.topic == "tns1:RuleEngine/tt:CellMotionDetector") {
+  if (is_cell_motion_topic(ev.topic)) {
     auto it = ev.data.find("IsMotion");
     if (it == ev.data.end()) return {};
     return Detection{fallback_type, it->second == "true", ev.event_time, true};
@@ -1445,20 +1432,9 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
   std::string default_obj_type, cam_override_type;
   {
     absl::MutexLock lk(&mu_);
-    if ((ev.topic == "tns1:RuleEngine/FieldDetector/ObjectsInside" ||
-         ev.topic == "tns1:UserAlarm/IVA/HumanShapeDetect"         ||
-         ev.topic == "tns1:VehicleAlarm/IVB/VehicleDetect"         ||
-         ev.topic == "tns1:RuleEngine/MyRuleDetector/PeopleDetect"  ||
-         ev.topic == "tns1:RuleEngine/MyRuleDetector/VehicleDetect" ||
-         ev.topic == "tns1:RuleEngine/MyRuleDetector/FaceDetect"    ||
-         ev.topic == "tns1:RuleEngine/MyRuleDetector/DogCatDetect"  ||
-         ev.topic == "tns1:RuleEngine/MyRuleDetector/Visitor"       ||
-         ev.topic == "tns1:RuleEngine/MyRuleDetector/Package"       ||
-         ev.topic == "tns1:RuleEngine/LineDetector/Crossed") &&
-        ev.property_op != "Initialized") {
+    if (is_ai_capable_topic(ev.topic) && ev.property_op != "Initialized") {
       ai_capable_cameras_.insert(ev.camera_ip);
-    } else if ((ev.topic == "tns1:RuleEngine/CellMotionDetector/Motion" ||
-                ev.topic == "tns1:RuleEngine/tt:CellMotionDetector") &&
+    } else if (is_cell_motion_topic(ev.topic) &&
                ev.property_op != "Initialized") {
       if (ai_capable_cameras_.count(ev.camera_ip)) return;
       cell_motion_cameras_.insert(ev.camera_ip);

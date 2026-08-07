@@ -250,51 +250,24 @@ class ReolinkCameraEmulator : public OnvifCameraEmulator {
 };
 
 // ============================================================
-// DahuaIvsLineCrossEmulator -- Dahua-family camera with IVS analytics.
+// ReplayCameraEmulator -- generic JSONL session replay.
 //
-// Replays a field capture (issue #45) whose notifications are richer
-// than anything else in the corpus:
-//   - tns1:RuleEngine/LineDetector/Crossed carrying ClassTypes
-//     (Human / Vehicle / Animal) alongside ObjectId and SeqNo -- the
-//     momentary topic that has no matching "ended" notification;
-//   - tns1:RuleEngine/FieldDetector/ObjectsInside, also with ClassTypes,
-//     which is what lets the recorder prefer the ONVIF object class over
-//     a vendor Rule name;
-//   - "tns1:RuleEngine/tt:CellMotionDetector", a firmware bug that leaks
-//     the tt: schema prefix into the topic path and drops the trailing
-//     /Motion;
-//   - a spread of RecordingConfig/*, Media/* and Device/Trigger/*
-//     housekeeping that must stay silent rather than being reported as
-//     unsupported detections.
+// Clamps CreatePullPointSubscription/Renew at their last recorded
+// response and cycles PullMessages forever.  That is all a captured
+// field session needs, so both cameras added from user dumps share it
+// rather than each getting a byte-identical subclass:
+//
+//   dahua_ivs_linecross_20260726.jsonl  -- IVS line crossing and field
+//     detection, both carrying ONVIF ClassTypes, plus a firmware-mangled
+//     "tns1:RuleEngine/tt:CellMotionDetector" topic and a spread of
+//     RecordingConfig/Media/Device housekeeping that must stay silent.
+//   reolink_ai_doorbell_20260725.jsonl  -- the whole MyRuleDetector
+//     family from one device: People / Vehicle / Face / DogCat /
+//     Visitor / Package, covering all four classes Protect models.
 // ============================================================
-class DahuaIvsLineCrossEmulator : public OnvifCameraEmulator {
+class ReplayCameraEmulator : public OnvifCameraEmulator {
  public:
-  explicit DahuaIvsLineCrossEmulator(const std::string& jsonl_path);
-
- protected:
-  std::pair<int, std::string> handle(
-    const std::string& path,
-    const std::string& soap_action,
-    const std::string& body) override;
-
- private:
-  RecordedSession session_;
-  std::size_t     create_idx_{0};
-  std::size_t     pull_idx_{0};
-  std::size_t     renew_idx_{0};
-  std::mutex      mu_;
-};
-
-// ============================================================
-// ReolinkAiDoorbellEmulator -- Reolink doorbell with the full
-// MyRuleDetector family in a single capture: PeopleDetect,
-// VehicleDetect, FaceDetect, DogCatDetect, Visitor and Package, all
-// sharing the Source/State shape.  Covers the four classes Protect
-// models (person / vehicle / animal / package) from one device.
-// ============================================================
-class ReolinkAiDoorbellEmulator : public OnvifCameraEmulator {
- public:
-  explicit ReolinkAiDoorbellEmulator(const std::string& jsonl_path);
+  explicit ReplayCameraEmulator(const std::string& jsonl_path);
 
  protected:
   std::pair<int, std::string> handle(
