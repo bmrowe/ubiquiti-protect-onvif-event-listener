@@ -7,8 +7,9 @@ name: Soak sync + build
 #   * Runs from the fork's DEFAULT branch (GitHub only schedules workflows
 #     from there). It fetches upstream fresh each run; it does NOT rebase
 #     `main` itself.
-#   * "Our fix" is derived from the PR branch (${PATCH_BRANCH}) as the commits
-#     unique to it vs its merge-base with upstream. Robust across rebases.
+#   * "Our fixes" are derived from the PR branches (${PATCH_BRANCHES}) as the
+#     commits unique to each vs its merge-base with upstream, replayed in the
+#     listed order. Robust across rebases.
 #   * A rebase/cherry-pick conflict never pushes a broken tree — it opens (or
 #     comments on) a tracking issue and fails the run for a human.
 #   * The rolling `soak-latest` release keeps a fixed-name asset
@@ -29,7 +30,12 @@ concurrency:
 
 env:
   UPSTREAM: https://github.com/danielwoz/ubiquiti-protect-onvif-event-listener.git
-  PATCH_BRANCH: fix/reolink-pet-and-drop-unclassified-motion
+  # Space-separated, applied in order. Each is a branch whose commits unique
+  # to it (vs its merge-base with upstream) get replayed onto the soak branch.
+  # Keep them single-purpose so each can be sent upstream as its own PR.
+  PATCH_BRANCHES: >-
+    fix/reolink-pet-and-drop-unclassified-motion
+    fix/ship-apt-keyring
   SOAK_BRANCH: soak
   RELEASE_TAG: soak-latest
   ASSET_STABLE: onvif-recorder_soak_arm64.deb
@@ -53,7 +59,9 @@ jobs:
         run: |
           git remote add upstream "$UPSTREAM"
           git fetch --tags upstream main
-          git fetch origin "$PATCH_BRANCH"
+          for b in $PATCH_BRANCHES; do
+            git fetch origin "$b"
+          done
           git fetch origin "$SOAK_BRANCH" || echo "(no soak branch yet — first run)"
           echo "upstream_sha=$(git rev-parse upstream/main)" >> "$GITHUB_OUTPUT"
 
@@ -66,8 +74,21 @@ jobs:
              && git rev-parse -q --verify origin/$SOAK_BRANCH >/dev/null; then
             BASE_BUILT=$(git merge-base origin/$SOAK_BRANCH upstream/main)
             if [ "$BASE_BUILT" = "$UP" ]; then
-              echo "No new upstream commits since last soak build — skipping."
+              echo "No new upstream commits since last soak build."
               BUILD=no
+              # Upstream is unchanged, but one of our own patch branches may
+              # have gained a commit (or been amended). `git cherry` marks
+              # with '+' any commit whose patch-id isn't already in soak;
+              # without this check a new local fix would sit unbuilt until
+              # upstream happened to move.
+              for b in $PATCH_BRANCHES; do
+                PB=$(git merge-base upstream/main "origin/$b")
+                if git cherry "origin/$SOAK_BRANCH" "origin/$b" "$PB" \
+                     | grep -q '^+'; then
+                  echo "Patch branch $b has commits not in soak — rebuilding."
+                  BUILD=yes
+                fi
+              done
             fi
           fi
           echo "build=$BUILD" >> "$GITHUB_OUTPUT"
@@ -77,16 +98,23 @@ jobs:
         if: steps.guard.outputs.build == 'yes'
         run: |
           set -e
-          PATCH_BASE=$(git merge-base upstream/main origin/$PATCH_BRANCH)
-          echo "Cherry-picking $(git rev-list --count $PATCH_BASE..origin/$PATCH_BRANCH) commit(s) from $PATCH_BRANCH"
           git checkout -B "$SOAK_BRANCH" upstream/main
-          if ! git cherry-pick "$PATCH_BASE..origin/$PATCH_BRANCH"; then
-            CONFLICTS=$(git diff --name-only --diff-filter=U | paste -sd', ' -)
-            git cherry-pick --abort || true
-            echo "conflict=1" >> "$GITHUB_OUTPUT"
-            echo "conflict_files=$CONFLICTS" >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
+          for b in $PATCH_BRANCHES; do
+            PATCH_BASE=$(git merge-base upstream/main "origin/$b")
+            N=$(git rev-list --count "$PATCH_BASE..origin/$b")
+            echo "Cherry-picking $N commit(s) from $b"
+            # NB: `[ … ] && continue` would abort the whole step under
+            # `set -e` when N != 0, since the && list returns non-zero.
+            if [ "$N" -eq 0 ]; then continue; fi
+            if ! git cherry-pick "$PATCH_BASE..origin/$b"; then
+              CONFLICTS=$(git diff --name-only --diff-filter=U | paste -sd', ' -)
+              git cherry-pick --abort || true
+              echo "conflict=1" >> "$GITHUB_OUTPUT"
+              echo "conflict_branch=$b" >> "$GITHUB_OUTPUT"
+              echo "conflict_files=$CONFLICTS" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+          done
           git push -f origin "$SOAK_BRANCH"
 
       - name: Open/append conflict tracking issue
@@ -95,14 +123,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TITLE="⚠️ Soak sync: our fix no longer rebases onto upstream/main"
-          BODY="The daily soak sync could not replay \`$PATCH_BRANCH\` onto \`upstream/main\` (\`${{ steps.fetch.outputs.upstream_sha }}\`).
+          BODY="The daily soak sync could not replay \`${{ steps.rebase.outputs.conflict_branch }}\` onto \`upstream/main\` (\`${{ steps.fetch.outputs.upstream_sha }}\`).
 
           **Conflicting files:** ${{ steps.rebase.outputs.conflict_files }}
 
           Resolve locally:
           \`\`\`
           git fetch origin && git fetch upstream main
-          git rebase upstream/main $PATCH_BRANCH   # fix conflicts, then push --force-with-lease
+          git rebase upstream/main ${{ steps.rebase.outputs.conflict_branch }}   # fix conflicts, then push --force-with-lease
           \`\`\`
           The soak build is paused until this is resolved."
           EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$TITLE in:title" --json number -q '.[0].number')
