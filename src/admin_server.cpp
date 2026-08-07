@@ -36,6 +36,7 @@ typedef int MHD_Result;
 #include <fstream>
 #include <functional>
 #include <map>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -850,6 +851,32 @@ std::string trim(std::string s) {
 // Very small JSON string extractor: finds `"key":"..."` and returns the value.
 // Does not handle escapes beyond \\ and \" — sufficient for our single-field
 // bodies from the admin page.
+// Like json_string_field but distinguishes "key absent" (nullopt) from
+// "key present with an empty value" (empty string).  handle_config needs
+// that difference: an absent key must keep whatever is already on disk,
+// whereas an explicitly empty one means the user cleared the setting.
+std::optional<std::string> json_string_field_opt(const std::string& body,
+                                                  const std::string& key) {
+  const std::string needle = "\"" + key + "\"";
+  size_t p = body.find(needle);
+  if (p == std::string::npos) return std::nullopt;
+  p = body.find(':', p);
+  if (p == std::string::npos) return std::nullopt;
+  p = body.find('"', p);
+  if (p == std::string::npos) return std::nullopt;
+  ++p;
+  std::string out;
+  while (p < body.size() && body[p] != '"') {
+    if (body[p] == '\\' && p + 1 < body.size()) {
+      out += body[p + 1];
+      p += 2;
+    } else {
+      out += body[p++];
+    }
+  }
+  return out;
+}
+
 std::string json_string_field(const std::string& body, const std::string& key) {
   const std::string needle = "\"" + key + "\"";
   size_t p = body.find(needle);
@@ -1316,10 +1343,21 @@ std::string build_first_party_json(const Ctx& ctx) {
 // new overrides applied.
 std::pair<int, std::string> handle_config(const Ctx& ctx,
                                           const std::string& body) {
-  std::map<std::string, std::string> values;
+  // Start from what is already persisted and overlay only the keys this
+  // request actually carries.  The admin page posts to this endpoint from
+  // several independent controls -- the Configuration card's "Save &
+  // Restart", the Camera Health card's via-Protect tickboxes, and the
+  // Enabled tickboxes -- and each sends only its own fields.  Rebuilding
+  // the whole file from a single request wrote every other key back as
+  // empty, so saving one section silently wiped the others (issue #46).
+  std::map<std::string, std::string> values =
+      runtime_config::ReadFromFile(ctx.config_path);
   for (const auto& e : runtime_config::Schema()) {
-    std::string raw = json_string_field(body, e.name);
-    // Validate non-empty values against the flag's parser.
+    auto raw_opt = json_string_field_opt(body, e.name);
+    if (!raw_opt.has_value()) continue;  // absent -> keep existing value
+    const std::string& raw = *raw_opt;
+    // Validate non-empty values against the flag's parser.  An empty
+    // value is the user clearing the setting, which is always allowed.
     if (!raw.empty()) {
       auto* flag = absl::FindCommandLineFlag(e.name);
       if (flag == nullptr) continue;  // schema/flag mismatch -- skip

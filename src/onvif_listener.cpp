@@ -598,6 +598,10 @@ class CameraWorker {
         }
       }
       // Inner loop exited (subscription dropped); reflect that in health.
+      // Release the subscription so the camera doesn't hold it until its
+      // termination time lapses.  Covers both the stop() path and a
+      // resubscribe after an error, which is where the leaks accumulate.
+      unsubscribe(sub.url, sub.ref_params);
       subscribed_at_ms_.store(0);
     }
     LOG(INFO) << '[' << cfg_.ip << "] stopped";
@@ -848,6 +852,41 @@ class CameraWorker {
       LOG_FIRST_N(WARNING, 1) << '[' << cfg_.ip << "] renew HTTP "
                               << resp_or->status_code;
     return absl::OkStatus();
+  }
+
+  // Politely tear the PullPoint subscription down.  Without this we just
+  // stop renewing and the camera holds the subscription until its
+  // termination time lapses -- so every restart leaks one, and a burst of
+  // restarts (the admin page's Save & Restart, or re-adding a camera)
+  // stacks them up.  Cameras and ONVIF proxies cap concurrent
+  // subscribers, and once that cap is hit new subscriptions are refused
+  // and events stop arriving entirely (issue #47).
+  //
+  // Best-effort by design: this runs on the shutdown path, so a short
+  // timeout and a swallowed failure are preferable to delaying exit.  If
+  // it doesn't land, behaviour is exactly what it was before.
+  void unsubscribe(const std::string& sub_url, const std::string& ref_params) {
+    if (sub_url.empty()) return;
+    static const char* ACTION =
+      "http://docs.oasis-open.org/wsn/bw-2/SubscriptionManager/"
+      "UnsubscribeRequest";
+
+    const std::string body =
+      "    <wsnt:Unsubscribe/>\n";
+
+    auto soap = build_soap(cfg_.user, cfg_.password, body, sub_url, ACTION,
+                           ref_params);
+    auto resp_or = soap_post_r(sub_url, soap, ACTION, 5);
+    if (!resp_or.ok()) {
+      LOG(INFO) << '[' << cfg_.ip << "] unsubscribe failed (non-fatal): "
+                << resp_or.status().message();
+      return;
+    }
+    if (resp_or->status_code == 200)
+      LOG(INFO) << '[' << cfg_.ip << "] subscription released";
+    else
+      LOG(INFO) << '[' << cfg_.ip << "] unsubscribe HTTP "
+                << resp_or->status_code << " (non-fatal)";
   }
 
   absl::Status pull(const std::string& sub_url, const std::string& ref_params,
