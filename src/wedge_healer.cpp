@@ -106,7 +106,7 @@ WedgeHealer::Reason WedgeHealer::decide_wedge(
   return Reason::kNone;
 }
 
-bool WedgeHealer::fire_restart(Reason r) {
+WedgeHealer::FireResult WedgeHealer::fire_restart(Reason r) {
   const auto now = std::chrono::steady_clock::now();
   const int64_t warmup_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
       now - boot_).count();
@@ -114,7 +114,7 @@ bool WedgeHealer::fire_restart(Reason r) {
     LOG(WARNING) << "[healer] " << reason_str(r)
                  << " trigger detected but suppressed (warmup, "
                  << warmup_ms / 1000 << "s < " << kWarmupSec << "s)";
-    return false;
+    return FireResult::kWaitAndRetry;
   }
   if (last_restart_ != std::chrono::steady_clock::time_point{}) {
     const int64_t since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -123,14 +123,14 @@ bool WedgeHealer::fire_restart(Reason r) {
       LOG(WARNING) << "[healer] " << reason_str(r)
                    << " trigger detected but suppressed (cooldown, "
                    << since_ms / 1000 << "s < " << kCooldownSec << "s)";
-      return false;
+      return FireResult::kWaitAndRetry;
     }
   }
   if (restart_count_.load() >= kMaxPerDay) {
     LOG(WARNING) << "[healer] " << reason_str(r)
                  << " trigger detected but suppressed (24 h cap reached: "
                  << restart_count_.load() << "/" << kMaxPerDay << ")";
-    return false;
+    return FireResult::kGaveUp;
   }
 
   const char* cmd_c = kRestartCmdMsrWedge;
@@ -162,7 +162,7 @@ bool WedgeHealer::fire_restart(Reason r) {
     if (history_.size() > static_cast<size_t>(kMaxPerDay))
       history_.erase(history_.begin());
   }
-  return true;
+  return FireResult::kRan;
 }
 
 void WedgeHealer::arm_flag_drift_check(
@@ -209,15 +209,33 @@ WedgeHealer::Reason WedgeHealer::maybe_check_flag_drift(bool force) {
   LOG(WARNING) << "[healer] " << drifted.size() << " of " << ids.size()
                << " camera(s) still show stale featureFlags in Protect "
                << "after " << kFlagDriftGraceSec << "s";
-  if (!fire_restart(Reason::kFlagDrift)) {
+  const FireResult fr = fire_restart(Reason::kFlagDrift);
+  if (fr == FireResult::kWaitAndRetry) {
     // A safeguard declined this one (most often warmup -- the common
     // path is an admin-UI toggle, which restarts *us*, so our own
     // uptime is near zero exactly when the drift appears).  Re-arm with
     // the cameras that are still drifting so the restart happens as
     // soon as it is permitted instead of being lost.
+    // Merge, don't assign: arm_flag_drift_check() may have added cameras
+    // while flag_drift_() was running with drift_mu_ released, and
+    // clobbering them would break the merge invariant that function
+    // documents.
     std::lock_guard<std::mutex> lk(drift_mu_);
-    drift_camera_ids_ = drifted;
+    for (const auto& id : drifted) {
+      if (std::find(drift_camera_ids_.begin(), drift_camera_ids_.end(), id) ==
+          drift_camera_ids_.end()) {
+        drift_camera_ids_.push_back(id);
+      }
+    }
     drift_armed_at_ = std::chrono::steady_clock::now();
+  } else if (fr == FireResult::kGaveUp) {
+    // The daily cap does not lift within this process, so re-arming would
+    // reschedule a Postgres query plus one HTTP GET per camera every
+    // kFlagDriftGraceSec, forever, with no possible progress.  Stay
+    // disarmed until something arms us again.
+    LOG(WARNING) << "[healer] featureFlags drift persists but the restart "
+                    "cap is reached; not re-arming. Restart onvif-recorder "
+                    "or restart unifi-protect manually to clear it.";
   }
   return Reason::kFlagDrift;
 }

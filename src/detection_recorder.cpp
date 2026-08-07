@@ -1483,17 +1483,49 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     // because they are what a handler for the topic would need.
     if (ev.property_op != "Initialized" &&
         !is_known_non_detection_topic(ev.topic)) {
-      const std::string key = ev.camera_ip + "|" + ev.topic;
+      std::string key = ev.camera_ip + "|" + ev.topic;
+      if (key.size() > kMaxTopicKeyLen) key.resize(kMaxTopicKeyLen);
       bool first = false;
+      bool just_capped = false;
       {
         absl::MutexLock lk(&mu_);
-        first = reported_unhandled_topics_.insert(key).second;
+        if (reported_unhandled_topics_.size() >= kMaxUnhandledTopics) {
+          // Report the cap once, then go quiet for the rest of the run.
+          if (!unhandled_topics_capped_) {
+            unhandled_topics_capped_ = true;
+            just_capped = true;
+          }
+        } else {
+          first = reported_unhandled_topics_.insert(key).second;
+        }
+      }
+      if (just_capped) {
+        LOG(WARNING) << "[unhandled-topic] reached the "
+                     << kMaxUnhandledTopics << "-entry cap; suppressing "
+                        "further unhandled-topic reports. A camera is "
+                        "likely emitting varying or malformed topic "
+                        "strings.";
       }
       if (first) {
+        // Field names and values are camera-controlled and unbounded.
+        // Truncate, and strip control characters -- a newline here would
+        // let a camera forge additional log lines, and these lines end up
+        // in diagnostic dumps that users attach to public issues.  Values
+        // are worth keeping (they tell us whether a topic is stateful or
+        // momentary) but they do not need to be long.
+        constexpr size_t kMaxVal = 120;
+        constexpr size_t kMaxLine = 600;
+        auto sanitise = [](std::string t, size_t cap) {
+          if (t.size() > cap) { t.resize(cap); t += "..."; }
+          for (char& c : t)
+            if (static_cast<unsigned char>(c) < 0x20 || c == 0x7f) c = '.';
+          return t;
+        };
         std::string keys;
         for (const auto& [k, v] : ev.data) {
+          if (keys.size() > kMaxLine) { keys += ", ..."; break; }
           if (!keys.empty()) keys += ", ";
-          keys += k + "=" + v;
+          keys += sanitise(k, kMaxVal) + "=" + sanitise(v, kMaxVal);
         }
         if (keys.empty()) keys = "(no data fields)";
         LOG(WARNING) << '[' << ev.camera_ip << "] unhandled ONVIF topic \""
@@ -1915,7 +1947,12 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
         db_->insert_event(event_id, ts_ms, ev.camera_ip, sdt_json, thumb_id, now_str,
                           rich_metadata,
                           rich_path ? thumb_id : std::string());
-        open_[key] = event_id;
+        // Momentary detections are closed synchronously in step 6, so
+        // they must never enter open_ -- `key` is (camera_ip, type), not
+        // an event identity, and inserting here would clobber a stateful
+        // detection of the same type that is still in progress, leaving
+        // its row unclosed for purge_stale_open_events to delete.
+        if (!det->momentary) open_[key] = event_id;
         if (max_events_per_hour_ > 0)
           recent_event_times_[ev.camera_ip].push_back(util::now_ms());
       }
@@ -2005,20 +2042,33 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     // *deletes* it five minutes later.  Mirrors the normal close path
     // below, but the end is derived from the event timestamp plus the
     // configured window rather than from wall-clock at close time.
-    if (det->momentary) {
+    //
+    // Only ever close the event THIS call opened.  `key` is
+    // (camera_ip, detection_type), not an event identity, so a crossing
+    // that resolves to "human" via ClassTypes shares a key with a
+    // stateful HumanShapeDetect / PeopleDetect / FieldDetector detection
+    // on the same camera -- and Dahua-family IVS cameras routinely run a
+    // cross-line rule alongside a human-shape rule.  Closing blindly on
+    // the key would either truncate that in-progress detection or, with
+    // coalescing off, erase its id from open_ so its real "ended" finds
+    // nothing and the row is left for purge_stale_open_events to delete.
+    // Likewise, if we coalesced into an existing event we only extended
+    // it; its lifecycle still belongs to whatever opened it.
+    if (det->momentary && coalesced_event_id.empty()) {
       absl::MutexLock lk(&mu_);
-      auto it = open_.find(key);
-      if (it != open_.end()) {
-        const uint64_t unpadded_end = ts_ms + momentary_event_ms_;
-        const uint64_t end_ms       = unpadded_end + post_buffer_ms_;
-        const std::string now_str   = util::utc_now_iso8601();
-        const std::string ended_id  = it->second;
-        db_->update_event_end(ended_id, end_ms, now_str);
-        open_.erase(it);
-        // Same bookkeeping the normal close does, so a burst of
-        // crossings coalesces into one event rather than N adjacent
-        // ones.
-        last_event_[key] = {ended_id, unpadded_end};
+      {
+        const uint64_t end_ms =
+            ts_ms + momentary_event_ms_ + post_buffer_ms_;
+        const std::string now_str = util::utc_now_iso8601();
+        db_->update_event_end(event_id, end_ms, now_str);
+        // (event_id is never in open_ for momentary detections.)
+        // Bookkeeping for coalescing.  real_end_ms is an *observed*
+        // wall-clock instant everywhere else (the case-2 guard compares
+        // it against now), so record when the crossing was seen rather
+        // than the synthetic end -- ts_ms + momentary is in the future,
+        // which would make the guard false and defeat the very burst
+        // coalescing this is here to enable.
+        last_event_[key] = {event_id, util::now_ms()};
       }
     }
 

@@ -691,5 +691,36 @@ std::pair<int, std::string> UosEmulator::handle(
     posted_.push_back(path);
     return {200, "{}"};
   }
+  // UOS external automation manager (the thumbnail-capable path).
+  if (path == "/internal/automationManager/external/change") {
+    register_bodies_.push_back(body);
+    return {200, "{}"};
+  }
+  if (path == "/internal/automationManager/external/actions/notify") {
+    notify_bodies_.push_back(body);
+    return {notify_status_, notify_status_ == 200 ? "{}" : ""};
+  }
   return {404, ""};
+}
+
+std::vector<std::string> UosEmulator::notify_bodies() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return notify_bodies_;
+}
+
+std::vector<std::string> UosEmulator::register_bodies() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return register_bodies_;
+}
+
+std::vector<std::string> UosEmulator::triggered_automations() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  std::vector<std::string> out = posted_;
+  out.insert(out.end(), notify_bodies_.begin(), notify_bodies_.end());
+  return out;
+}
+
+void UosEmulator::set_notify_status(int code) {
+  std::lock_guard<std::mutex> lk(mu_);
+  notify_status_ = code;
 }

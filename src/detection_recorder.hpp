@@ -552,7 +552,17 @@ class DetectionRecorder {
   // event.  Cameras whose only events are on topics classify() does not
   // recognise otherwise look completely dead to the user with nothing in
   // the log to explain why (issue #45).
+  // Bounded: the key embeds ev.topic, which is camera-controlled and
+  // unbounded in length, so a hostile or firmware-buggy camera that
+  // varies its topic per notification would otherwise grow this set
+  // without limit inside a root daemon on a memory-constrained
+  // appliance.  PullMessages carries up to 100 messages per ~5 s pull,
+  // so that is a fast leak.  Past the cap we simply stop tracking and
+  // stop warning -- by then the log has more than enough to diagnose.
+  static constexpr size_t kMaxUnhandledTopics = 256;
+  static constexpr size_t kMaxTopicKeyLen     = 200;
   std::set<std::string> reported_unhandled_topics_;
+  bool unhandled_topics_capped_{false};
 
   // Optional object detector for thumbnail subject cropping.
   // Set before run(); read-only (non-owning pointer) after that.

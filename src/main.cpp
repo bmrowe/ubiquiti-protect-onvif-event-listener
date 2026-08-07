@@ -1349,12 +1349,26 @@ int main(int argc, char* argv[]) {
         // for the presence of a non-empty smartDetectTypes array is
         // enough: the drift we are hunting is [] in Protect vs
         // ["person","vehicle"] in Postgres.
+        // Locate the key, then require the very next non-space character
+        // after its colon to be '['.  The previous version took the first
+        // '[' anywhere after the key, which had two bad failure modes:
+        // a "smartDetectTypes":null would silently latch onto an unrelated
+        // array later in the document (e.g. smartDetectZones), and -- worse
+        // -- the key is matched anywhere in the raw body, including inside
+        // a user-controlled string value.  Protect camera names are set by
+        // the user, so naming a camera  "smartDetectTypes": []  was enough
+        // to fake drift and make us run `systemctl restart unifi-protect`.
         const size_t k = body.find("\"smartDetectTypes\"");
         if (k == std::string::npos) continue;
-        const size_t lb = body.find('[', k);
-        const size_t rb = (lb == std::string::npos)
-                              ? std::string::npos : body.find(']', lb);
-        if (lb == std::string::npos || rb == std::string::npos) continue;
+        size_t c = body.find(':', k + 18);
+        if (c == std::string::npos) continue;
+        ++c;
+        while (c < body.size() &&
+               std::isspace(static_cast<unsigned char>(body[c]))) ++c;
+        if (c >= body.size() || body[c] != '[') continue;  // null / not an array
+        const size_t lb = c;
+        const size_t rb = body.find(']', lb);
+        if (rb == std::string::npos) continue;
         const std::string api_arr = body.substr(lb, rb - lb + 1);
         bool api_empty = true;
         for (size_t i = 1; i + 1 < api_arr.size(); ++i) {

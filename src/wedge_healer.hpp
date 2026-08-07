@@ -148,9 +148,16 @@ class WedgeHealer {
   // @p force).  Disarms afterwards either way.  Returns kFlagDrift if
   // drift was found and a restart was requested.
   Reason maybe_check_flag_drift(bool force);
-  // Returns true if the restart command actually ran; false when a
-  // safeguard (warmup / cooldown / daily cap) suppressed it.
-  bool fire_restart(Reason r);
+  // Why a restart attempt did or didn't run.  The distinction matters for
+  // the flag-drift path: a time-bounded suppression is worth waiting out
+  // and retrying, but the daily cap never lifts within a process, so
+  // re-arming against it would spin forever.
+  enum class FireResult {
+    kRan,          // command executed
+    kWaitAndRetry, // warmup or cooldown -- try again later
+    kGaveUp,       // daily cap reached; retrying cannot help
+  };
+  FireResult fire_restart(Reason r);
 
   MsrSnapshotFn                     msr_snapshot_;
   ExecFn                            exec_;

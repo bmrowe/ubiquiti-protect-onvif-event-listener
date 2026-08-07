@@ -331,6 +331,22 @@ class UosEmulator : public OnvifCameraEmulator {
   /// Returns the URL path of every POST received at /api/automations/*/run.
   std::vector<std::string> posted_events() const;
 
+  /// Bodies POSTed to the UOS external automation manager.  Without
+  /// these the recorder's UOS path 404s, silently latches its legacy
+  /// fallback, and every test quietly exercises the OLD notification
+  /// path instead of the feature under test.
+  std::vector<std::string> notify_bodies() const;
+  std::vector<std::string> register_bodies() const;
+  /// Make /actions/notify answer with @p code (default 200).  Lets a
+  /// test drive the 500 re-register retry and the 404 fallback.
+  void set_notify_status(int code);
+
+  /// Every notification the recorder sent, by whichever path it chose --
+  /// the legacy /api/automations/{id}/run URL or the UOS notify body.
+  /// Both embed the automation id, so tests can assert WHICH automation
+  /// fired without coupling to the transport.
+  std::vector<std::string> triggered_automations() const;
+
   /// Base URL of this server, e.g. "http://127.0.0.1:54321".
   std::string base_url() const;
 
@@ -344,4 +360,7 @@ class UosEmulator : public OnvifCameraEmulator {
   mutable std::mutex       mu_;
   std::string              alarms_json_{"[]"};
   std::vector<std::string> posted_;
+  std::vector<std::string> notify_bodies_;
+  std::vector<std::string> register_bodies_;
+  int                      notify_status_{200};
 };

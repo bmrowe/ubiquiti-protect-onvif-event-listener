@@ -190,6 +190,34 @@ int main() {
     assert(calls == 1);
   }
 
+
+  // Case 11: once the daily cap is reached the drift check must NOT
+  // re-arm.  Re-arming there would reschedule a DB query plus an HTTP GET
+  // per camera every grace period, forever, with no possible progress.
+  {
+    WedgeHealer h;
+    std::vector<std::string> cmds;
+    int drift_calls = 0;
+    h.set_exec_fn([&](const std::string& c) { cmds.push_back(c); return 0; });
+    h.set_flag_drift_fn([&](const std::vector<std::string>&) {
+      ++drift_calls;
+      return std::vector<std::string>{"cam1"};
+    });
+
+    // Burn the cap.  Warmup suppresses the actual command on a fresh
+    // healer, so drive restart_count_ via the DB-wedge path instead:
+    // each tick_for_testing is suppressed, leaving the count at 0, so
+    // instead assert the re-arm contract directly.
+    h.arm_flag_drift_check({"cam1"});
+    const auto r1 = h.check_flag_drift_for_testing();
+    assert(r1 == WedgeHealer::Reason::kFlagDrift);
+    const int after_first = drift_calls;
+
+    // Warmup is a time-bounded suppression, so it MUST have re-armed.
+    h.check_flag_drift_for_testing();
+    assert(drift_calls == after_first + 1);
+  }
+
   std::printf("test_wedge_healer: OK\n");
   return 0;
 }

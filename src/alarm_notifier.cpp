@@ -184,9 +184,16 @@ bool AlarmNotifier::should_re_register(long code) {  // NOLINT(runtime/int)
 }
 
 bool AlarmNotifier::uos_unavailable(long code) {  // NOLINT(runtime/int)
-  // 404: the route isn't mounted, which is what Protect does when Global
-  // Alarm Manager is off.  0: the request never completed (curl error).
-  return code == 404 || code == 0;
+  // Only a 404 is evidence the route isn't mounted, which is what Protect
+  // does when Global Alarm Manager is off.
+  //
+  // Deliberately NOT code == 0.  Zero means the request never completed --
+  // a connect refusal or timeout -- which is exactly what happens while
+  // Protect is restarting, including a restart WedgeHealer itself just
+  // triggered.  Latching on that would permanently drop every install to
+  // the no-thumbnail path after one transient blip, and tell the user to
+  // go change a Protect setting that was never the problem.
+  return code == 404;
 }
 
 void AlarmNotifier::set_notify_via_uos(bool enabled) {
@@ -639,6 +646,16 @@ AlarmNotifier::AlarmNotifier(std::string protect_url,
 }
 
 void AlarmNotifier::refresh_alarms() {
+  // Re-arm the UOS path on every refresh (every ~5 min).  If Global Alarm
+  // Manager really is off we will get another 404 on the next notify and
+  // latch again, at the cost of one failed request per refresh; but if the
+  // 404 was situational -- Protect mid-restart, a partially-initialised
+  // automation manager -- thumbnails come back on their own instead of
+  // staying off until someone restarts the recorder.
+  {
+    absl::MutexLock lk(&mu_);
+    uos_unavailable_ = false;
+  }
   std::string url;
   {
     absl::MutexLock lk(&mu_);

@@ -1517,7 +1517,7 @@ static void test_alarm_notify_person() {
   notifier.refresh_alarms();
   notifier.notify("person", "AABBCCDDEEFF", "event-uuid-abc", 1234567890000ULL);
 
-  const auto posted = uos.posted_events();
+  const auto posted = uos.triggered_automations();
   CHECK(posted.size() == 1,
         "alarm_notify_person: expected 1 POST, got "
         + std::to_string(posted.size()));
@@ -1525,8 +1525,6 @@ static void test_alarm_notify_person() {
   if (!posted.empty()) {
     CHECK(posted[0].find("aaa111") != std::string::npos,
           "alarm_notify_person: POST path missing automation ID");
-    CHECK(posted[0].find("/run") != std::string::npos,
-          "alarm_notify_person: POST path missing /run");
   }
 }
 
@@ -1554,7 +1552,7 @@ static void test_alarm_type_filtering() {
   // Person detection → only person automation fires.
   notifier.notify("person", "112233445566", "evt-p", 1000ULL);
   {
-    const auto p = uos.posted_events();
+    const auto p = uos.triggered_automations();
     CHECK(p.size() == 1,
           "alarm_type_filtering: person: expected 1 POST, got "
           + std::to_string(p.size()));
@@ -1569,7 +1567,7 @@ static void test_alarm_type_filtering() {
   // Vehicle detection → only vehicle automation fires.
   notifier.notify("vehicle", "112233445566", "evt-v", 2000ULL);
   {
-    const auto p = uos.posted_events();
+    const auto p = uos.triggered_automations();
     CHECK(p.size() == 2,
           "alarm_type_filtering: vehicle: expected 2 total POSTs, got "
           + std::to_string(p.size()));
@@ -1595,7 +1593,7 @@ static void test_alarm_no_alarms() {
   notifier.refresh_alarms();
   notifier.notify("person", "AABBCCDDEEFF", "evt-x", 999ULL);
 
-  const auto posted = uos.posted_events();
+  const auto posted = uos.triggered_automations();
   CHECK(posted.empty(),
         "alarm_no_alarms: expected 0 POSTs, got " + std::to_string(posted.size()));
 }
@@ -1666,7 +1664,7 @@ static void test_alarm_integration_e2e(const std::string& ubv_dir) {
   //   1 vehicle detection × 1 alarm = 1 POST
   //   Total: 3 POSTs
   // posted_events() now returns URL paths like /api/automations/{id}/run.
-  const auto posted = uos.posted_events();
+  const auto posted = uos.triggered_automations();
   CHECK(posted.size() == 3,
         "alarm_integration_e2e: expected 3 POSTs (2 person + 1 vehicle), got "
         + std::to_string(posted.size()));
@@ -1683,10 +1681,14 @@ static void test_alarm_integration_e2e(const std::string& ubv_dir) {
         "alarm_integration_e2e: expected 1 vehicle POST, got "
         + std::to_string(vehicle_posts));
 
-  // Every POST must target the /run endpoint.
-  for (const auto& path : posted) {
-    CHECK(path.find("/run") != std::string::npos,
-          "alarm_integration_e2e: POST path missing /run: " + path);
+  // Every notification must name the automation it fired.  Deliberately
+  // not asserting the transport: with Global Alarm Manager available the
+  // recorder uses the UOS notify body, and falls back to the legacy
+  // /api/automations/{id}/run URL when it is not.  Both carry the id.
+  for (const auto& n : posted) {
+    CHECK(n.find("person_auto") != std::string::npos ||
+          n.find("vehicle_auto") != std::string::npos,
+          "alarm_integration_e2e: notification names no automation: " + n);
   }
 }
 
@@ -1816,7 +1818,7 @@ static void test_alarm_notify_animal() {
   // Animal detection → only animal automation fires.
   notifier.notify("animal", "AABBCCDDEEFF", "evt-animal", 1000ULL);
   {
-    const auto p = uos.posted_events();
+    const auto p = uos.triggered_automations();
     CHECK(p.size() == 1,
           "alarm_notify_animal: expected 1 POST for animal, got "
           + std::to_string(p.size()));
@@ -1831,7 +1833,7 @@ static void test_alarm_notify_animal() {
   // Package detection → only package automation fires.
   notifier.notify("package", "AABBCCDDEEFF", "evt-package", 2000ULL);
   {
-    const auto p = uos.posted_events();
+    const auto p = uos.triggered_automations();
     CHECK(p.size() == 2,
           "alarm_notify_animal: expected 2 total POSTs after package, got "
           + std::to_string(p.size()));
@@ -2399,6 +2401,130 @@ static void test_drop_unclassified_spares_line_crossing() {
   // emulator so the snapshot/NanoDet path the drop hangs off is exercised.
 }
 
+
+
+// A momentary crossing must never close an unrelated stateful detection
+// that happens to share its (camera, type) key.  Dahua IVS cameras run a
+// cross-line rule alongside a human-shape rule, so a crossing carrying
+// ClassTypes=Human lands on the same key as an in-progress person event.
+static void test_momentary_does_not_close_stateful_event() {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  CHECK(rec_or.ok(), "momentary/stateful: CreateWithBackend failed");
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_coalesce_window(0);   // isolate: no merging
+  recorder.set_buffer(0, 0);
+
+  const char* kCam = "192.168.1.220";
+
+  // Person walks in -> stateful event opens and stays open.
+  onvif::OnvifEvent start;
+  start.camera_ip   = kCam;
+  start.topic       = "tns1:UserAlarm/IVA/HumanShapeDetect";
+  start.event_time  = "2026-03-24T12:00:00Z";
+  start.property_op = "Changed";
+  start.data["State"] = "true";
+  recorder.on_event(start);
+  CHECK(bptr->events.size() == 1, "stateful event should open");
+  const std::string person_id = bptr->events.front().id;
+
+  // Line crossing on the same camera, same resolved type.
+  onvif::OnvifEvent cross;
+  cross.camera_ip   = kCam;
+  cross.topic       = "tns1:RuleEngine/LineDetector/Crossed";
+  cross.event_time  = "2026-03-24T12:00:05Z";
+  cross.property_op = "Changed";
+  cross.data["ObjectId"]   = "1";
+  cross.data["ClassTypes"] = "Human";   // -> "human", same key as above
+  recorder.on_event(cross);
+
+  // The person's event must still be open and untouched.
+  for (const auto& e : bptr->events) {
+    if (e.id == person_id) {
+      CHECK(e.end_ms == 0,
+            "stateful person event must NOT be closed by a crossing");
+    }
+  }
+
+  // Person leaves -> their own end must still land.
+  onvif::OnvifEvent stop = start;
+  stop.event_time  = "2026-03-24T12:01:00Z";
+  stop.data["State"] = "false";
+  recorder.on_event(stop);
+
+  bool closed = false;
+  for (const auto& e : bptr->events)
+    if (e.id == person_id && e.end_ms != 0) closed = true;
+  CHECK(closed,
+        "stateful person event must still close via its own ended event");
+}
+
+
+// The UOS notification path is the whole point of the thumbnail feature,
+// and until UosEmulator learned these endpoints every test here silently
+// exercised the legacy fallback instead.  Pin the payload schema, the
+// startup registration, and the re-register-on-500 retry.
+static void test_uos_notify_payload_and_retry() {
+  onvif::ProtectUserIdProvider uid("test-user-id", "");
+
+  // Part 1: payload schema + registration.
+  {
+    UosEmulator uos;
+    uos.set_alarms_json(R"([{"id":"aaa111","name":"Front person",
+      "enable":true,"conditions":[{"source":"person"}]}])");
+    uos.start();
+
+    onvif::AlarmNotifier notifier(uos.base_url(), &uid);
+    notifier.refresh_alarms();
+    notifier.notify("person", "AABBCCDDEEFF", "event-uuid-abc",
+                    1234567890000ULL);
+
+    const auto regs = uos.register_bodies();
+    CHECK(!regs.empty(),
+          "UOS: startup must register automations with the external manager");
+
+    const auto bodies = uos.notify_bodies();
+    CHECK(bodies.size() == 1,
+          "UOS: expected 1 notify body, got " + std::to_string(bodies.size()));
+    if (!bodies.empty()) {
+      const std::string& b = bodies[0];
+      // The real eventId is the entire reason this path exists -- the
+      // legacy endpoint hardcodes "expectedNoEventId" so Protect can
+      // never resolve a thumbnail.
+      CHECK(b.find("event-uuid-abc") != std::string::npos,
+            "UOS: notify body must carry the real eventId");
+      CHECK(b.find("\"alarm_id\":\"aaa111\"") != std::string::npos,
+            "UOS: notify body must name the automation");
+      CHECK(b.find("sourceEvent") != std::string::npos,
+            "UOS: notify body must carry sourceEvent for thumbnail lookup");
+      CHECK(b.find("test-user-id") != std::string::npos,
+            "UOS: notify body must address a receiver");
+    }
+  }
+
+  // Part 2: HTTP 500 ("Alarm not found") re-registers and retries.
+  {
+    UosEmulator uos;
+    uos.set_alarms_json(R"([{"id":"bbb222","name":"Gate person",
+      "enable":true,"conditions":[{"source":"person"}]}])");
+    uos.start();
+    uos.set_notify_status(500);
+
+    onvif::AlarmNotifier notifier(uos.base_url(), &uid);
+    notifier.refresh_alarms();
+    const size_t regs_before = uos.register_bodies().size();
+
+    notifier.notify("person", "AABBCCDDEEFF", "event-uuid-500",
+                    1234567890000ULL);
+
+    CHECK(uos.notify_bodies().size() == 2,
+          "UOS: a 500 must be retried once, got " +
+              std::to_string(uos.notify_bodies().size()) + " attempt(s)");
+    CHECK(uos.register_bodies().size() > regs_before,
+          "UOS: a 500 must trigger a re-registration before the retry");
+  }
+}
 
 static void test_coalesce_window() {
   auto backend = std::make_unique<MockBackend>();
@@ -3055,6 +3181,10 @@ int main() {
            [&] { test_drop_unclassified_motion(ubv_dir); });
   run_test("drop_unclassified_spares_line_crossing",
            [] { test_drop_unclassified_spares_line_crossing(); });
+  run_test("uos_notify_payload_and_retry",
+           [] { test_uos_notify_payload_and_retry(); });
+  run_test("momentary_does_not_close_stateful_event",
+           [] { test_momentary_does_not_close_stateful_event(); });
   run_test("class_types_mapping",
            [] { test_class_types_mapping(); });
   run_test("line_crossing_synthetic_duration",

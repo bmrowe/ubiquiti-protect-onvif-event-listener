@@ -109,8 +109,9 @@ int main() {
   {
     check(AlarmNotifierTest::uos_unavailable(404),
           "HTTP 404 means UOS unavailable");
-    check(AlarmNotifierTest::uos_unavailable(0),
-          "curl failure means UOS unavailable");
+    check(!AlarmNotifierTest::uos_unavailable(0),
+          "a failed request is transient, NOT proof the route is absent "
+          "(Protect restarting must not permanently disable thumbnails)");
     check(!AlarmNotifierTest::uos_unavailable(500),
           "HTTP 500 is re-register, not unavailable");
     check(!AlarmNotifierTest::uos_unavailable(204),
