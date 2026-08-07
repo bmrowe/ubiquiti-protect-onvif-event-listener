@@ -49,6 +49,14 @@ const std::vector<Entry>& Schema() {
      "Seconds of padding added after a detection's end time.  Raise it if "
      "clips cut off before the subject has left frame.",
      "Detection"},
+    {"notify_via_uos", Type::Bool,
+     "Send push notifications via Protect's UOS external automation "
+     "manager so a thumbnail can be attached.  Requires Protect's Global "
+     "Alarm Manager (Settings -> Alarm Manager -> switch Local to "
+     "Global).  When that is off we fall back to the legacy notification "
+     "path automatically -- notifications still fire, just without a "
+     "thumbnail.  Default on.",
+     "Detection"},
     {"drop_unclassified_motion", Type::Bool,
      "Drop generic motion events with no ONVIF class that NanoDet-M cannot "
      "classify, instead of recording them as default_object_type.  Camera AI "

@@ -37,6 +37,12 @@ struct AlarmNotifierTest {
       const std::string& json) {
     return AlarmNotifier::parse_automations(json);
   }
+  static bool should_re_register(long code) {  // NOLINT(runtime/int)
+    return AlarmNotifier::should_re_register(code);
+  }
+  static bool uos_unavailable(long code) {  // NOLINT(runtime/int)
+    return AlarmNotifier::uos_unavailable(code);
+  }
 };
 
 }  // namespace onvif
@@ -84,6 +90,31 @@ int main() {
       check(v[0].cooldown_enabled, "cooldown_enabled true");
       check(v[0].cooldown_ms == 15000, "cooldown_ms 15000");
     }
+  }
+
+  // HTTP 500 should trigger re-registration, other codes should not.
+  {
+    check(AlarmNotifierTest::should_re_register(500),
+          "HTTP 500 triggers re-registration");
+    check(!AlarmNotifierTest::should_re_register(204),
+          "HTTP 204 does not re-register");
+    check(!AlarmNotifierTest::should_re_register(401),
+          "HTTP 401 does not re-register");
+  }
+
+  // Global Alarm Manager off => 404 (route absent) or 0 (request never
+  // completed) means fall back to the legacy path.  A 500 is the
+  // re-register case and must NOT be mistaken for "unavailable", or we
+  // would permanently downgrade on a transient eviction.
+  {
+    check(AlarmNotifierTest::uos_unavailable(404),
+          "HTTP 404 means UOS unavailable");
+    check(AlarmNotifierTest::uos_unavailable(0),
+          "curl failure means UOS unavailable");
+    check(!AlarmNotifierTest::uos_unavailable(500),
+          "HTTP 500 is re-register, not unavailable");
+    check(!AlarmNotifierTest::uos_unavailable(204),
+          "HTTP 204 is success, not unavailable");
   }
 
   // Deleted entries are dropped.

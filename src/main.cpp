@@ -350,6 +350,17 @@ ABSL_FLAG(bool, auto_heal_protect, true,
     "restarts per 24 h. Every restart is logged at ERROR level and "
     "surfaced on the admin page's Recent errors card. Set to false to "
     "disable and rely on the user to restart Protect manually.");
+ABSL_FLAG(bool, notify_via_uos, true,
+    "Send Protect automation notifications through the UOS external "
+    "automation manager instead of the legacy /api/automations/<id>/run "
+    "endpoint. Only this path can attach a thumbnail to the push "
+    "notification, because the legacy endpoint hardcodes "
+    "eventId=\"expectedNoEventId\" internally so Protect can never "
+    "resolve the event. Requires Protect's Global Alarm Manager "
+    "(Settings -> Alarm Manager -> Local to Global); when it is off the "
+    "endpoint returns 404 and we fall back to the legacy path "
+    "automatically, logging once at ERROR. Set false to always use the "
+    "legacy path.");
 ABSL_FLAG(bool, drop_unclassified_motion, false,
     "Drop generic motion events (CellMotionDetector, VideoSource/MotionAlarm) "
     "that carry no ONVIF object class and that NanoDet-M cannot classify, "
@@ -1105,6 +1116,7 @@ int main(int argc, char* argv[]) {
   if (!protect_user_id_provider.empty()) {
     alarm_notifier = std::make_unique<onvif::AlarmNotifier>(
         absl::GetFlag(FLAGS_protect_url), &protect_user_id_provider, db_conn);
+    alarm_notifier->set_notify_via_uos(absl::GetFlag(FLAGS_notify_via_uos));
     alarm_notifier->refresh_alarms();
     det_rec.set_alarm_notifier(alarm_notifier.get());
   } else {

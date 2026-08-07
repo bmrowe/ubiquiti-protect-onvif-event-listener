@@ -22,6 +22,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <fstream>
+#include <map>
 #include <set>
 #include <string>
 #include <utility>
@@ -170,11 +171,28 @@ static std::set<std::string> parse_sources(const std::string& arr) {
   return devs;
 }
 
+
 }  // namespace
 
 // ============================================================
 // AlarmNotifier::parse_automations
 // ============================================================
+
+bool AlarmNotifier::should_re_register(long code) {  // NOLINT(runtime/int)
+  // Only the UOS "Alarm not found" case is recoverable by re-registering.
+  return code == 500;
+}
+
+bool AlarmNotifier::uos_unavailable(long code) {  // NOLINT(runtime/int)
+  // 404: the route isn't mounted, which is what Protect does when Global
+  // Alarm Manager is off.  0: the request never completed (curl error).
+  return code == 404 || code == 0;
+}
+
+void AlarmNotifier::set_notify_via_uos(bool enabled) {
+  absl::MutexLock lk(&mu_);
+  notify_via_uos_ = enabled;
+}
 
 std::vector<AlarmNotifier::AutomationEntry> AlarmNotifier::parse_automations(
     const std::string& json) {
@@ -398,19 +416,145 @@ std::string AlarmNotifier::http_get(const std::string& url) {
   return body;
 }
 
-void AlarmNotifier::http_post(const std::string& url, const std::string& body) {
+long AlarmNotifier::http_post(const std::string& url,  // NOLINT(runtime/int)
+                               const std::string& body) {
   long code = perform_post(url, user_id_provider_->current(), body);  // NOLINT(runtime/int)
   if (code == 401 && user_id_provider_->try_refresh()) {
     LOG(INFO) << "[alarm] retrying POST " << url << " after user_id refresh";
     code = perform_post(url, user_id_provider_->current(), body);  // NOLINT(runtime/int)
   }
-  if (code == 0) return;  // network error already logged
+  if (code == 0) return code;  // network error already logged
   if (code < 200 || code >= 300) {
     LOG(ERROR) << "[alarm] POST " << url << " HTTP " << code
                << " -- " << categorise_failure(code);
   } else {
     LOG(INFO) << "[alarm] POST " << url << " → " << code;
   }
+  return code;
+}
+
+// ============================================================
+// Automation registration
+// ============================================================
+
+void AlarmNotifier::register_automation(const AutomationEntry& entry) {
+  // Build the /change payload understood by the UOS automation manager:
+  //
+  // {"type":"created","data":[{
+  //   "id":           "<automation-uuid>",
+  //   "title":        "<name>",
+  //   "is_paused":    false,
+  //   "triggers_data":[[{"id":"person","is_matched_externally":true}], ...],
+  //   "actions_data": [[{"id":"notify"}]]
+  // }]}
+  //
+  // triggers_data is a 2-D array where the outer dimension is OR and the inner
+  // is AND.  We emit one inner singleton per trigger type (OR semantics).
+  using onvif::util::json_str;
+
+  std::string triggers;
+  for (const auto& t : entry.trigger_types) {
+    if (!triggers.empty()) triggers += ',';
+    triggers += "[{\"id\":";
+    triggers += json_str(t);
+    triggers += ",\"is_matched_externally\":true}]";
+  }
+
+  std::string payload;
+  payload.reserve(256);
+  payload += "{\"type\":\"created\",\"data\":[{";
+  payload += "\"id\":";           payload += json_str(entry.id);
+  payload += ",\"title\":";       payload += json_str(entry.name);
+  payload += ",\"is_paused\":false";
+  payload += ",\"triggers_data\":["; payload += triggers; payload += "]";
+  payload += ",\"actions_data\":[[{\"id\":\"notify\"}]]";
+  payload += "}]}";
+
+  std::string url;
+  {
+    absl::MutexLock lk(&mu_);
+    url = protect_url_;
+  }
+  long code = http_post(  // NOLINT(runtime/int)
+      url + "/internal/automationManager/external/change", payload);
+  if (code == 204 || (code >= 200 && code < 300)) {
+    LOG(INFO) << "[alarm] registered automation " << entry.id
+              << " (\"" << entry.name << "\") with UOS automation manager";
+  } else {
+    LOG(ERROR) << "[alarm] failed to register automation " << entry.id
+               << " HTTP " << code;
+  }
+}
+
+// ============================================================
+// Internal notify payload builder
+// ============================================================
+
+// static
+std::string AlarmNotifier::build_notify_payload(
+    const std::string& alarm_id,
+    const std::string& event_key,
+    const std::string& camera_db_id,
+    const std::string& event_id,
+    uint64_t           ts_ms,
+    const std::string& user_id) {
+  using onvif::util::json_str;
+  char ts_buf[24];
+  std::snprintf(ts_buf, sizeof(ts_buf), "%" PRIu64, ts_ms);
+
+  // Target schema (derived from Protect service.js / defaultUosActionDataSchema):
+  //
+  // {
+  //   "alarm_id": "<automation-uuid>",
+  //   "events": [{
+  //     "id":    "<event_key>",           // EventKeys enum value e.g. "person"
+  //     "scope": { "site_id": "protect" },
+  //     "metadata": {
+  //       "event": {
+  //         "key":       "<event_key>",
+  //         "device":    "<camera_db_id>", // camera DB UUID (not MAC)
+  //         "eventId":   "<uuid>",         // real events.id → thumbnail anchor
+  //         "timestamp": <ms>,
+  //         "sourceEvent": {               // ← causes buildEventFromSource to
+  //           "cameraId": "<camera_db_id>" //   find live event + thumbnail
+  //         }
+  //       },
+  //       "allEvents": [{ "key":..., "device":..., "eventId":...,
+  //                       "timestamp":... }]
+  //     }
+  //   }],
+  //   "data":      { "is_critical": false },
+  //   "receivers": [{ "user_id": "<ucore-uuid>", "push": true,
+  //                   "email": false, "voip": false }]
+  // }
+  //
+  // The sourceEvent.cameraId field is the key difference from the legacy
+  // /api/automations/<id>/run path (which hardcodes "expectedNoEventId").
+  // Protect's buildEventFromSource uses cameraId to look up the CameraDecalModel
+  // by PK, then findEvent to fetch the event row (with DB fallback), and finally
+  // getThumbnail to resolve the snapshot URL attached to the push payload.
+
+  std::string p;
+  p.reserve(720);
+  p += "{\"alarm_id\":";           p += json_str(alarm_id);
+  p += ",\"events\":[{\"id\":";    p += json_str(event_key);
+  p += ",\"scope\":{\"site_id\":\"protect\"}";
+  p += ",\"metadata\":{\"event\":{";
+  p +=   "\"key\":";               p += json_str(event_key);
+  p +=   ",\"device\":";           p += json_str(camera_db_id);
+  p +=   ",\"eventId\":";          p += json_str(event_id);
+  p +=   ",\"timestamp\":";        p += ts_buf;
+  p +=   ",\"sourceEvent\":{\"cameraId\":"; p += json_str(camera_db_id); p += "}";
+  p += "},\"allEvents\":[{";
+  p +=   "\"key\":";               p += json_str(event_key);
+  p +=   ",\"device\":";           p += json_str(camera_db_id);
+  p +=   ",\"eventId\":";          p += json_str(event_id);
+  p +=   ",\"timestamp\":";        p += ts_buf;
+  p += "}]}}]";
+  p += ",\"data\":{\"is_critical\":false}";
+  p += ",\"receivers\":[{\"user_id\":"; p += json_str(user_id);
+  p += ",\"push\":true,\"email\":false,\"voip\":false}]}";
+  return p;
 }
 
 // ============================================================
@@ -500,6 +644,49 @@ void AlarmNotifier::refresh_alarms() {
     absl::MutexLock lk(&mu_);
     url = protect_url_;
   }
+
+  // ---- Step 1: build MAC → camera DB UUID map --------------------------------
+  // Protect's buildEventFromSource looks up cameras by DB UUID (PK), not MAC.
+  // We query the DB directly rather than parsing the /api/cameras JSON response
+  // because Protect wraps the camera array in an envelope object whose exact
+  // schema varies by version, making JSON parsing fragile.  The DB is the
+  // single source of truth that Protect itself reads from.
+  if (!db_connstr_.empty()) {
+    PGconn* cam_conn = PQconnectdb(db_connstr_.c_str());
+    if (PQstatus(cam_conn) == CONNECTION_OK) {
+      PGresult* cam_res = onvif::pg::ExecParamsWithTimeout(
+          cam_conn, /*timeout_ms=*/-1,
+          "SELECT id, mac FROM cameras",
+          0, nullptr, nullptr, nullptr, nullptr, 0);
+      if (PQresultStatus(cam_res) == PGRES_TUPLES_OK) {
+        std::map<std::string, std::string> cam_map;
+        const int nrows = PQntuples(cam_res);
+        for (int r = 0; r < nrows; ++r) {
+          std::string id  = PQgetvalue(cam_res, r, 0);
+          std::string mac = PQgetvalue(cam_res, r, 1);
+          if (!id.empty() && !mac.empty()) cam_map[mac] = id;
+        }
+        LOG(INFO) << "[alarm] loaded " << cam_map.size()
+                  << " camera(s) from DB";
+        absl::MutexLock lk(&mu_);
+        mac_to_camera_id_ = std::move(cam_map);
+      } else {
+        LOG(ERROR) << "[alarm] camera DB query failed: "
+                   << PQresultErrorMessage(cam_res);
+      }
+      PQclear(cam_res);
+      PQfinish(cam_conn);
+    } else {
+      LOG(ERROR) << "[alarm] camera DB connect failed: "
+                 << PQerrorMessage(cam_conn);
+      PQfinish(cam_conn);
+    }
+  } else {
+    LOG(WARNING) << "[alarm] no db_connstr configured -- camera UUID map "
+                 << "unavailable; push notifications will fire without thumbnails";
+  }
+
+  // ---- Step 2: load automations ----------------------------------------------
   const std::string response = http_get(url + "/api/automations");
   if (response.empty()) return;
 
@@ -519,6 +706,17 @@ void AlarmNotifier::refresh_alarms() {
               << " sources=" << a.source_devices.size()
               << " cooldown=" << a.cooldown_enabled
               << "/" << a.cooldown_ms << "ms";
+  }
+
+  // ---- Step 3: register each enabled automation with the UOS store ----------
+  // The in-memory UOS automation manager (automationManager) requires a
+  // /change "created" call before /actions/notify will succeed.  This
+  // registration is lost on every Protect restart; we redo it here.
+  // notify() will also re-register on-demand when it receives HTTP 500.
+  for (const auto& entry : parsed) {
+    if (entry.enabled) {
+      register_automation(entry);
+    }
   }
 
   absl::MutexLock lk(&mu_);
@@ -543,10 +741,22 @@ void AlarmNotifier::notify(const std::string& obj_type,
   if (need_refresh) refresh_alarms();
 
   std::vector<AutomationEntry> automations_copy;
+  std::string camera_db_id;
   {
     absl::MutexLock lk(&mu_);
     automations_copy = automations_;
     url = protect_url_;
+    // Resolve camera MAC → DB UUID for the thumbnail lookup.
+    auto cam_it = mac_to_camera_id_.find(camera_mac);
+    if (cam_it != mac_to_camera_id_.end()) {
+      camera_db_id = cam_it->second;
+    }
+  }
+
+  if (camera_db_id.empty()) {
+    LOG(WARNING) << "[alarm] no DB UUID found for camera MAC " << camera_mac
+                 << " -- thumbnails will be missing; will retry on next "
+                 << "refresh_alarms() (every 5 min) or Protect restart";
   }
 
   for (const auto& automation : automations_copy) {
@@ -575,8 +785,67 @@ void AlarmNotifier::notify(const std::string& obj_type,
     }
 
     LOG(INFO) << "[alarm] triggering automation " << automation.id
-              << " for " << obj_type << " on " << camera_mac;
-    http_post(url + "/api/automations/" + automation.id + "/run", "{}");
+              << " for " << obj_type << " on " << camera_mac
+              << " event_id=" << event_id;
+    {
+      // Use the camera's DB UUID as the device identifier so that
+      // buildEventFromSource resolves the live event + thumbnail.
+      // Falls back to the MAC if the UUID is not yet known (no thumbnail,
+      // but the notification still fires).
+      const std::string device_id =
+          camera_db_id.empty() ? camera_mac : camera_db_id;
+
+      const std::string notify_url =
+          url + "/internal/automationManager/external/actions/notify";
+      const std::string payload = build_notify_payload(
+          automation.id, obj_type, device_id, event_id, ts_ms,
+          user_id_provider_->current());
+
+      bool use_uos;
+      {
+        absl::MutexLock lk(&mu_);
+        use_uos = notify_via_uos_ && !uos_unavailable_;
+      }
+
+      long code = 0;  // NOLINT(runtime/int)
+      if (use_uos) {
+        code = http_post(notify_url, payload);
+        if (uos_unavailable(code)) {
+          // Protect's Global Alarm Manager is off, so this endpoint does
+          // not exist.  Say so once -- with the fix -- then use the legacy
+          // path from here on.  Without this the notification would simply
+          // vanish on every upgrade where the setting was never enabled.
+          LOG(ERROR) << "[alarm] UOS automation manager unavailable (HTTP "
+                     << code << "); falling back to the legacy "
+                     << "/api/automations/<id>/run path for all "
+                     << "notifications. Thumbnails cannot be attached on "
+                     << "that path -- to enable them, switch Protect "
+                     << "Settings -> Alarm Manager from Local to Global.";
+          {
+            absl::MutexLock lk(&mu_);
+            uos_unavailable_ = true;
+          }
+          use_uos = false;
+        }
+      }
+
+      if (!use_uos) {
+        // Legacy path: fires the automation but cannot carry a thumbnail,
+        // because Protect hardcodes eventId="expectedNoEventId" here.
+        http_post(url + "/api/automations/" + automation.id + "/run", "{}");
+      }
+
+      // HTTP 500 ("Alarm not found") means the in-memory UOS registration
+      // was evicted, typically because Protect restarted.  Re-register and
+      // retry once; the next refresh_alarms() will also re-register.
+      if (should_re_register(code)) {
+        LOG(WARNING) << "[alarm] automation " << automation.id
+                     << " not found in UOS store (HTTP 500); "
+                     << "re-registering and retrying";
+        register_automation(automation);
+        http_post(notify_url, payload);
+      }
+    }
 
     // Record in automationsHistory so Protect UI shows hits and history.
     record_history(automation, obj_type, camera_mac, event_id, ts_ms);
