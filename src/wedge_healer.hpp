@@ -46,6 +46,7 @@ class WedgeHealer {
   static constexpr int kWarmupSec   = 300;   // 5 min
   static constexpr int kCooldownSec = 300;   // 5 min
   static constexpr int kMaxPerDay   = 4;
+  static constexpr int kDaySec      = 24 * 60 * 60;
 
   // Callback to fetch the current MSR success / failure snapshot from
   // detection_recorder.  Called on the monitor thread with no locks
@@ -103,6 +104,16 @@ class WedgeHealer {
   void set_msr_snapshot_fn(MsrSnapshotFn fn) { msr_snapshot_ = std::move(fn); }
   void set_exec_fn(ExecFn fn) { exec_ = std::move(fn); }
   void set_flag_drift_fn(FlagDriftFn fn) { flag_drift_ = std::move(fn); }
+
+  /// Persist restart timestamps to @p path so the cooldown and the
+  /// 24-hour cap survive our own restarts.  Without this both are
+  /// process-local: the service uses Restart=always and the admin page's
+  /// Save & Restart deliberately exits the process, so every config save
+  /// silently reset the "4 per 24 h" limit to zero -- meaning a restart
+  /// loop elsewhere could drive unbounded Protect restarts.  Warmup stays
+  /// process-local by design; it is about OUR uptime.
+  /// Must be called before start().  Empty path disables persistence.
+  void set_state_path(const std::string& path);
 
   // Arm a one-shot featureFlags drift check for @p camera_ids.  Call this
   // immediately after enable_smart_detect() writes flags into Postgres.
@@ -171,7 +182,17 @@ class WedgeHealer {
   std::thread                       thread_;
   std::atomic<uint64_t>             restart_count_{0};
   std::chrono::steady_clock::time_point boot_{};
-  std::chrono::steady_clock::time_point last_restart_{};
+  // Wall-clock (epoch seconds) of restarts we have issued, newest last,
+  // pruned to the last kDaySec.  Wall-clock rather than steady_clock
+  // because these outlive the process.  Guarded by history_mu_.
+  std::string                       state_path_;
+  std::vector<int64_t>              restart_times_;
+  void load_state();
+  void persist_state();
+  // Restarts within the last 24 h, and seconds since the most recent
+  // (-1 if none).  Caller must hold history_mu_.
+  int  restarts_in_window_locked() const;
+  int64_t secs_since_last_restart_locked() const;
   // History under a small mutex; recorded newest-last then trimmed.
   mutable std::mutex                history_mu_;
   std::vector<RestartRecord>        history_;

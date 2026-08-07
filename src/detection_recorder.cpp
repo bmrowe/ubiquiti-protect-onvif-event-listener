@@ -1694,6 +1694,10 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     //     requests while RTSP is active (issue #34, field-observed).
     //     Falls back to the direct path if Protect can't serve it.
     std::vector<unsigned char> snapshot;
+    // Did NanoDet-M actually produce a class for this event?  Tracked out
+    // here because the --drop_unclassified_motion decision must not depend
+    // on whether a snapshot happened to arrive (see below).
+    bool nanodet_classified = false;
     if (db_->needs_snapshot() && (!snap_url.empty() || snap_via_protect)) {
       if (snap_via_protect && !protect_url_copy.empty() &&
           protect_user_id_provider_copy && !cam_uuid.empty()) {
@@ -1753,33 +1757,12 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
           // identified a security-relevant object, use its class to set the
           // detection type (person / vehicle / animal) in all tables.
           // Per-camera type overrides (cam_override_type) take priority.
+          if (det_result) nanodet_classified = true;
           if (det->from_fallback && cam_override_type.empty() && det_result) {
             const std::string inferred =
                 object_detect::detection_type(det_result->class_id);
             obj_type = inferred;
             sdt_json = smart_detect_types_json(inferred);
-          }
-          // Drop unclassified generic motion when --drop_unclassified_motion
-          // is set: a fallback (CellMotionDetector / MotionAlarm) event with
-          // no per-camera override and no NanoDet-M detection would otherwise
-          // be recorded as default_object_type (person), which floods the
-          // timeline with false positives on AI cameras that already emit
-          // proper Person/Vehicle/Pet events.  Discard it instead.  Only new
-          // events are dropped; a coalescing merge into an existing real
-          // event is left untouched.
-          //
-          // Momentary topics are deliberately exempt.  A line crossing is a
-          // deliberate analytic trip -- the camera's IVS rule fired on a
-          // tracked object -- not pixel noise, so it is worth recording even
-          // when the camera sends no ClassTypes and NanoDet-M can't refine it
-          // from the snapshot.
-          if (drop_unclassified && det->from_fallback && !det->momentary &&
-              cam_override_type.empty() && !det_result &&
-              coalesced_event_id.empty()) {
-            LOG(INFO) << '[' << ev.camera_ip
-                      << "] dropping unclassified motion event "
-                         "(--drop_unclassified_motion, no NanoDet-M detection)";
-            return;
           }
           // Only crop when we have a basis: an ONVIF bbox, or a loaded
           // detector (which may yield a result or fall back to smart-crop).
@@ -1800,6 +1783,27 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     } else if (db_->needs_snapshot() && snap_url.empty()) {
       LOG(INFO) << '[' << ev.camera_ip << "] no snapshot URL configured "
                 << "— thumbnail will be missing";
+    }
+
+    // Drop unclassified generic motion when --drop_unclassified_motion is
+    // set.  Deliberately evaluated HERE, after the snapshot block, rather
+    // than inside it: a fallback event is unclassified whether the
+    // snapshot arrived or not, and nesting the decision under a
+    // successful fetch made the flag silently no-op on exactly the
+    // firmwares it exists for -- cameras whose HTTP snapshot endpoint
+    // chokes while RTSP is streaming are the ones flooding the timeline
+    // with phantom "person" events in the first place.
+    //
+    // Momentary topics stay exempt: a line crossing is a deliberate
+    // analytic trip, not pixel noise.  Coalescing merges are left alone,
+    // since those extend an event that already exists.
+    if (drop_unclassified && det->from_fallback && !det->momentary &&
+        cam_override_type.empty() && !nanodet_classified &&
+        coalesced_event_id.empty()) {
+      LOG(INFO) << '[' << ev.camera_ip
+                << "] dropping unclassified motion event "
+                   "(--drop_unclassified_motion)";
+      return;
     }
 
     // 3b. Forward the cropped JPEG to MSR when configured.  MSR persists it as

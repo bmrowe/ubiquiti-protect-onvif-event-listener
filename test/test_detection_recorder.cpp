@@ -2526,6 +2526,59 @@ static void test_uos_notify_payload_and_retry() {
   }
 }
 
+
+// --drop_unclassified_motion must not depend on a snapshot arriving.  It
+// previously sat inside the snapshot-success block, so it silently
+// no-opped whenever the fetch failed -- i.e. on exactly the flaky-snapshot
+// firmwares that generate the phantom "person" events it exists to stop.
+static void test_drop_unclassified_without_snapshot() {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  CHECK(rec_or.ok(), "drop/no-snapshot: CreateWithBackend failed");
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_drop_unclassified_motion(true);
+  recorder.set_coalesce_window(0);
+  // No set_snapshot() call at all, so there is no snapshot URL and the
+  // whole fetch/crop/NanoDet block is skipped.
+
+  onvif::OnvifEvent m;
+  m.camera_ip   = "192.168.1.230";
+  m.topic       = "tns1:RuleEngine/CellMotionDetector/Motion";
+  m.event_time  = "2026-03-24T13:00:00Z";
+  m.property_op = "Changed";
+  m.data["IsMotion"] = "true";
+  recorder.on_event(m);
+
+  CHECK(bptr->events.empty(),
+        "unclassified motion must be dropped even with no snapshot, got " +
+            std::to_string(bptr->events.size()));
+
+  // A real camera AI event on the same recorder is still recorded.
+  onvif::OnvifEvent ai;
+  ai.camera_ip   = "192.168.1.231";
+  ai.topic       = "tns1:UserAlarm/IVA/HumanShapeDetect";
+  ai.event_time  = "2026-03-24T13:01:00Z";
+  ai.property_op = "Changed";
+  ai.data["State"] = "true";
+  recorder.on_event(ai);
+  CHECK(bptr->events.size() == 1,
+        "camera AI events must survive --drop_unclassified_motion, got " +
+            std::to_string(bptr->events.size()));
+
+  // And so is a line crossing (momentary exemption).
+  onvif::OnvifEvent cross;
+  cross.camera_ip   = "192.168.1.232";
+  cross.topic       = "tns1:RuleEngine/LineDetector/Crossed";
+  cross.event_time  = "2026-03-24T13:02:00Z";
+  cross.property_op = "Changed";
+  cross.data["ObjectId"] = "9";
+  recorder.on_event(cross);
+  CHECK(bptr->events.size() == 2,
+        "line crossings must survive --drop_unclassified_motion, got " +
+            std::to_string(bptr->events.size()));
+}
+
 static void test_coalesce_window() {
   auto backend = std::make_unique<MockBackend>();
   MockBackend* bptr = backend.get();
@@ -3181,6 +3234,8 @@ int main() {
            [&] { test_drop_unclassified_motion(ubv_dir); });
   run_test("drop_unclassified_spares_line_crossing",
            [] { test_drop_unclassified_spares_line_crossing(); });
+  run_test("drop_unclassified_without_snapshot",
+           [] { test_drop_unclassified_without_snapshot(); });
   run_test("uos_notify_payload_and_retry",
            [] { test_uos_notify_payload_and_retry(); });
   run_test("momentary_does_not_close_stateful_event",

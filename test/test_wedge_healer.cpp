@@ -11,7 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
 #include <cassert>
+#include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -216,6 +218,46 @@ int main() {
     // Warmup is a time-bounded suppression, so it MUST have re-armed.
     h.check_flag_drift_for_testing();
     assert(drift_calls == after_first + 1);
+  }
+
+
+  // Case 12: the 24 h cap must survive our own restart.  The service uses
+  // Restart=always and the admin page's Save & Restart exits the process,
+  // so a process-local counter meant every config save reset the cap --
+  // which would let a restart loop drive unbounded Protect restarts.
+  {
+    const std::string path = "/tmp/healer_restarts_test";
+    std::remove(path.c_str());
+    // Pretend a previous process already used the whole budget just now.
+    {
+      std::ofstream f(path);
+      const int64_t now = static_cast<int64_t>(std::time(nullptr));
+      for (int i = 0; i < WedgeHealer::kMaxPerDay; ++i) f << (now - 10) << "\n";
+    }
+
+    WedgeHealer h;
+    std::vector<std::string> cmds;
+    h.set_exec_fn([&](const std::string& c) { cmds.push_back(c); return 0; });
+    h.set_state_path(path);
+    h.set_flag_drift_fn([](const std::vector<std::string>&) {
+      return std::vector<std::string>{"cam1"};
+    });
+
+    h.arm_flag_drift_check({"cam1"});
+    h.check_flag_drift_for_testing();
+    assert(cmds.empty());   // cap inherited from the previous process
+
+    // And an entry outside the window must NOT count against the cap.
+    {
+      std::ofstream f(path, std::ios::trunc);
+      const int64_t old = static_cast<int64_t>(std::time(nullptr))
+                            - WedgeHealer::kDaySec - 60;
+      f << old << "\n";
+    }
+    WedgeHealer h2;
+    h2.set_state_path(path);
+    assert(h2.restart_count() == 0);
+    std::remove(path.c_str());
   }
 
   std::printf("test_wedge_healer: OK\n");

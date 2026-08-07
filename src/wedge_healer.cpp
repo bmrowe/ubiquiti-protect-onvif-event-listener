@@ -13,6 +13,8 @@
 #include "wedge_healer.hpp"
 
 #include <algorithm>
+#include <fstream>
+#include <ctime>
 #include <cstdlib>
 #include <mutex>  // NOLINT(build/c++11)
 #include <string>
@@ -53,6 +55,67 @@ int default_exec(const std::string& cmd) {
 }
 
 }  // namespace
+
+
+namespace {
+int64_t now_epoch_sec() {
+  return static_cast<int64_t>(std::time(nullptr));
+}
+}  // namespace
+
+void WedgeHealer::set_state_path(const std::string& path) {
+  std::lock_guard<std::mutex> lk(history_mu_);
+  state_path_ = path;
+  load_state();
+}
+
+void WedgeHealer::load_state() {
+  restart_times_.clear();
+  if (state_path_.empty()) return;
+  std::ifstream f(state_path_);
+  if (!f.is_open()) return;   // first run
+  const int64_t cutoff = now_epoch_sec() - kDaySec;
+  int64_t t = 0;
+  while (f >> t) {
+    // Ignore anything outside the window, and anything in the future --
+    // a clock step backwards must not lock the healer out indefinitely.
+    if (t > cutoff && t <= now_epoch_sec()) restart_times_.push_back(t);
+  }
+  std::sort(restart_times_.begin(), restart_times_.end());
+  if (!restart_times_.empty()) {
+    LOG(INFO) << "[healer] restored " << restart_times_.size()
+              << " restart(s) from the last 24 h from " << state_path_;
+  }
+}
+
+void WedgeHealer::persist_state() {
+  if (state_path_.empty()) return;
+  const std::string tmp = state_path_ + ".tmp";
+  {
+    std::ofstream f(tmp, std::ios::trunc);
+    if (!f.is_open()) {
+      LOG(WARNING) << "[healer] cannot write " << tmp
+                   << "; restart cap will not survive a restart";
+      return;
+    }
+    for (int64_t t : restart_times_) f << t << "\n";
+  }
+  if (std::rename(tmp.c_str(), state_path_.c_str()) != 0) {
+    LOG(WARNING) << "[healer] cannot rename " << tmp << " -> " << state_path_;
+  }
+}
+
+int WedgeHealer::restarts_in_window_locked() const {
+  const int64_t cutoff = now_epoch_sec() - kDaySec;
+  int n = 0;
+  for (int64_t t : restart_times_) if (t > cutoff) ++n;
+  return n;
+}
+
+int64_t WedgeHealer::secs_since_last_restart_locked() const {
+  if (restart_times_.empty()) return -1;
+  return now_epoch_sec() - restart_times_.back();
+}
 
 WedgeHealer::WedgeHealer()
   : exec_(default_exec),
@@ -116,21 +179,23 @@ WedgeHealer::FireResult WedgeHealer::fire_restart(Reason r) {
                  << warmup_ms / 1000 << "s < " << kWarmupSec << "s)";
     return FireResult::kWaitAndRetry;
   }
-  if (last_restart_ != std::chrono::steady_clock::time_point{}) {
-    const int64_t since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - last_restart_).count();
-    if (since_ms < kCooldownSec * 1000LL) {
+  {
+    std::lock_guard<std::mutex> lk(history_mu_);
+    const int64_t since = secs_since_last_restart_locked();
+    if (since >= 0 && since < kCooldownSec) {
       LOG(WARNING) << "[healer] " << reason_str(r)
                    << " trigger detected but suppressed (cooldown, "
-                   << since_ms / 1000 << "s < " << kCooldownSec << "s)";
+                   << since << "s < " << kCooldownSec << "s)";
       return FireResult::kWaitAndRetry;
     }
-  }
-  if (restart_count_.load() >= kMaxPerDay) {
-    LOG(WARNING) << "[healer] " << reason_str(r)
-                 << " trigger detected but suppressed (24 h cap reached: "
-                 << restart_count_.load() << "/" << kMaxPerDay << ")";
-    return FireResult::kGaveUp;
+    const int in_window = restarts_in_window_locked();
+    if (in_window >= kMaxPerDay) {
+      LOG(WARNING) << "[healer] " << reason_str(r)
+                   << " trigger detected but suppressed (24 h cap reached: "
+                   << in_window << "/" << kMaxPerDay
+                   << ", counted across restarts of this service)";
+      return FireResult::kGaveUp;
+    }
   }
 
   const char* cmd_c = kRestartCmdMsrWedge;
@@ -154,10 +219,16 @@ WedgeHealer::FireResult WedgeHealer::fire_restart(Reason r) {
   } else {
     LOG(WARNING) << "[healer] Protect services restarted successfully";
   }
-  last_restart_ = now;
   restart_count_.fetch_add(1);
   {
     std::lock_guard<std::mutex> lk(history_mu_);
+    restart_times_.push_back(now_epoch_sec());
+    const int64_t cutoff = now_epoch_sec() - kDaySec;
+    restart_times_.erase(
+        std::remove_if(restart_times_.begin(), restart_times_.end(),
+                       [cutoff](int64_t t) { return t <= cutoff; }),
+        restart_times_.end());
+    persist_state();
     history_.push_back(RestartRecord{r, warmup_ms, cmd, rc});
     if (history_.size() > static_cast<size_t>(kMaxPerDay))
       history_.erase(history_.begin());

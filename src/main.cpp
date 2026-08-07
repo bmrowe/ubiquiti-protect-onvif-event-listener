@@ -813,6 +813,18 @@ int main(int argc, char* argv[]) {
   det_rec.set_momentary_event_sec(momentary_sec);
   det_rec.set_drop_unclassified_motion(
       absl::GetFlag(FLAGS_drop_unclassified_motion));
+  // With no detector there is nothing to classify with, so the flag stops
+  // meaning "drop what NanoDet-M couldn't identify" and starts meaning
+  // "drop every generic motion event".  That may be what someone wants,
+  // but it should never be a surprise.
+  if (absl::GetFlag(FLAGS_drop_unclassified_motion) &&
+      !absl::GetFlag(FLAGS_detect) && !absl::GetFlag(FLAGS_detect_override)) {
+    LOG(WARNING) << "[detect] --drop_unclassified_motion is set but NanoDet-M "
+                    "is disabled (--detect=false), so EVERY generic motion "
+                    "event will be dropped -- only camera-reported AI events "
+                    "and per-camera overrides will be recorded. Enable "
+                    "--detect if that is not what you intended.";
+  }
   det_rec.set_coalesce_window(
       static_cast<uint32_t>(absl::GetFlag(FLAGS_coalesce_window_sec)));
   det_rec.set_max_events_per_hour(
@@ -1310,6 +1322,10 @@ int main(int argc, char* argv[]) {
   std::unique_ptr<onvif::WedgeHealer> healer;
   if (absl::GetFlag(FLAGS_auto_heal_protect)) {
     healer = std::make_unique<onvif::WedgeHealer>();
+    // Persist the restart window so the cooldown and 24 h cap survive our
+    // own restarts -- the admin page's Save & Restart exits the process,
+    // so without this every config save reset the cap to zero.
+    healer->set_state_path(state_dir + "/healer-restarts");
     healer->set_msr_snapshot_fn([&det_rec]() {
       const auto s = det_rec.msr_snapshot();
       return onvif::WedgeHealer::MsrSnapshot{
