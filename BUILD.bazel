@@ -603,6 +603,7 @@ cc_binary(
     linkstatic = True,
     deps = [
         ":event_enricher",
+        ":event_recovery",
         ":pg_util",
         ":util",
         "@com_google_absl//absl/flags:flag",

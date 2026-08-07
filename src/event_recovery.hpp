@@ -81,6 +81,21 @@ int next_batch_size(int current_size,
                     int min_size,
                     int max_size);
 
+// Event types EnrichRestored is allowed to rewrite.
+//
+// Enrichment replaces events.metadata wholesale with a synthesised
+// detection blob, so it must only ever run against rows that ARE
+// detections.  Protect writes plenty of other camera-scoped events --
+// adminActivity, ring, motion, lowMemory, streamRecovery,
+// cameraConnected, videoExported -- whose metadata carries real
+// payloads it owns.  Rewriting those destroys them irrecoverably.
+bool IsEnrichableEventType(const std::string& type);
+
+// The same list rendered as a SQL literal list for an IN (...) clause,
+// e.g. "'smartDetectZone','smartDetectLine'".  Single source of truth
+// with IsEnrichableEventType so the query and the predicate can't drift.
+std::string EnrichableEventTypesSqlList();
+
 // One discovered backup file with its on-disk timestamp.
 struct Backup {
   std::string path;        // absolute

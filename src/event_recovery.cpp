@@ -95,7 +95,35 @@ bool RunSimple(PGconn* conn, const std::string& sql) {
   return ok;
 }
 
+// Detection event types.  smartDetectZone is what both Protect and this
+// recorder write for object detections; smartDetectLine covers line-cross
+// rules and smartAudioDetect the audio analytics events.  Anything not
+// listed here keeps the metadata Protect gave it.
+constexpr const char* kEnrichableEventTypes[] = {
+  "smartDetectZone",
+  "smartDetectLine",
+  "smartAudioDetect",
+};
+
 }  // namespace
+
+bool IsEnrichableEventType(const std::string& type) {
+  for (const char* t : kEnrichableEventTypes) {
+    if (type == t) return true;
+  }
+  return false;
+}
+
+std::string EnrichableEventTypesSqlList() {
+  std::string out;
+  for (const char* t : kEnrichableEventTypes) {
+    if (!out.empty()) out += ",";
+    out += "'";
+    out += t;
+    out += "'";
+  }
+  return out;
+}
 
 bool ShouldRecoverFromTimestamps(int64_t oldest_event_ms,
                                   int64_t oldest_recording_ms,
@@ -269,7 +297,20 @@ absl::Status EnrichRestored(PGconn* conn, EnrichOptions opts) {
   // days is longer than any restore window we ship or expect users to
   // hit, and events older than that predate the enrichment machinery
   // being useful.
-  const char* select_events =
+  //
+  // Restricted to detection event types.  The only gate used to be
+  // "cameraId IS NOT NULL", which also matched every camera-scoped event
+  // Protect writes for its own purposes -- adminActivity, ring, motion,
+  // lowMemory, streamRecovery, cameraConnected, videoExported.  Those
+  // carry real payloads (adminActivity holds userAction / userName /
+  // clientPlatform; ring holds the doorbell press detail), and the pass
+  // overwrote them with the synthetic detection blob, destroying the
+  // originals.  Observed on the dev router: 889 of 890 adminActivity
+  // rows clobbered.  Enrichment only ever has something meaningful to
+  // say about a smart detection, so match on type and leave the rest of
+  // Protect's table alone.
+  const std::string select_events_str =
+      std::string(
       "SELECT e.id, e.\"cameraId\", e.type, "
       "       e.\"smartDetectTypes\"::text, "
       "       e.start, COALESCE(e.\"end\", e.start), "
@@ -277,6 +318,7 @@ absl::Status EnrichRestored(PGconn* conn, EnrichOptions opts) {
       "       COALESCE(e.\"thumbnailId\", '') "
       "FROM events e "
       "WHERE e.\"cameraId\" IS NOT NULL "
+      "  AND e.type IN (") + EnrichableEventTypesSqlList() + ") "
       "  AND e.start > $2::bigint "
       "  AND ( "
       "    e.metadata IS NULL "
@@ -293,6 +335,7 @@ absl::Status EnrichRestored(PGconn* conn, EnrichOptions opts) {
       "  ) "
       "ORDER BY e.start "
       "LIMIT $1";
+  const char* select_events = select_events_str.c_str();
 
   // Adaptive sizing constants.  Start small enough that the very first
   // SELECT stays comfortably inside the DB's per-connection timeout;

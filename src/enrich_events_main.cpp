@@ -44,6 +44,7 @@
 #include "absl/strings/str_split.h"
 
 #include "event_enricher.hpp"
+#include "event_recovery.hpp"
 #include "pg_util.hpp"
 #include "util.hpp"
 
@@ -211,6 +212,11 @@ int main(int argc, char** argv) {
       "       COALESCE(\"thumbnailId\", '') "
       "FROM events "
       "WHERE \"cameraId\" = " + SqlLiteral(cam) +
+      // Detections only.  This UPDATEs metadata wholesale, and Protect's
+      // own camera-scoped events (adminActivity, ring, motion, ...) carry
+      // payloads it owns -- rewriting them destroys the originals.
+      " AND type IN (" +
+      onvif::event_recovery::EnrichableEventTypesSqlList() + ")" +
       " AND start >= " + std::to_string(day_start) +
       " AND start <  " + std::to_string(day_end) +
       " ORDER BY start";

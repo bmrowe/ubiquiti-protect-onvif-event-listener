@@ -14,6 +14,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 #include "event_recovery.hpp"
@@ -162,9 +163,51 @@ void test_batch_no_change_on_zero_elapsed() {
             25, 0, 2000, 5, 500) == 25);
 }
 
+
+// EnrichRestored rewrites events.metadata wholesale.  Its only gate used
+// to be "cameraId IS NOT NULL", which matched every camera-scoped event
+// Protect writes for itself -- and the pass replaced their real payloads
+// with a synthetic detection blob.  On the dev router that clobbered 889
+// of 890 adminActivity rows (userAction / userName / clientPlatform) plus
+// every ring, motion, lowMemory and streamRecovery row.  Irrecoverable,
+// so pin the allowlist hard.
+void test_only_detection_types_are_enrichable() {
+  CHECK(onvif::event_recovery::IsEnrichableEventType("smartDetectZone"));
+  CHECK(onvif::event_recovery::IsEnrichableEventType("smartDetectLine"));
+  CHECK(onvif::event_recovery::IsEnrichableEventType("smartAudioDetect"));
+
+  // Every one of these was observed clobbered in the field.
+  for (const char* t : {"adminActivity", "ring", "motion", "lowMemory",
+                        "streamRecovery", "cameraConnected", "videoExported",
+                        "cameraDigitalInputChanged", "disconnect", "update",
+                        "offline", "access", ""}) {
+    if (onvif::event_recovery::IsEnrichableEventType(t)) {
+      std::fprintf(stderr, "type %s must not be enrichable\n", t);
+      std::exit(1);
+    }
+  }
+}
+
+// The predicate above is only worth anything if the query actually uses
+// it -- the filter lives in SQL, so assert the rendered list is what the
+// IN (...) clause gets.
+void test_sql_type_list_matches_predicate() {
+  const std::string list = onvif::event_recovery::EnrichableEventTypesSqlList();
+  CHECK(list.find("'smartDetectZone'") != std::string::npos);
+  CHECK(list.find("'smartDetectLine'") != std::string::npos);
+  CHECK(list.find("'smartAudioDetect'") != std::string::npos);
+  CHECK(list.find("adminActivity") == std::string::npos);
+  CHECK(list.find("ring") == std::string::npos);
+  // Quoted + comma separated, no trailing comma.
+  CHECK(list.front() == '\'' && list.back() == '\'');
+  CHECK(list.find(",,") == std::string::npos);
+}
+
 }  // namespace
 
 int main() {
+  test_only_detection_types_are_enrichable();
+  test_sql_type_list_matches_predicate();
   test_no_events_means_recover();
   test_no_recordings_means_no_recover();
   test_event_older_than_recording_no_recover();
