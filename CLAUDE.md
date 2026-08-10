@@ -146,8 +146,13 @@ Optionally, per-camera UBV thumbnail files are also written to `ONVIF_UBV_DIR` i
 - One thread per camera in `OnvifListener`; `EventCallback` is called from camera
   threads and must be thread-safe.
 - `CameraConfig::max_consecutive_failures` (default 0 = unlimited) controls give-up
-  behaviour; `main.cpp` sets it to 5 for production. Tests leave it at 0 because
+  behaviour; `main.cpp` sets it to 3 for production. Tests leave it at 0 because
   some emulated cameras replay startup-failure responses before succeeding.
+- Reconnect backoff after a failure run is bounded exponential:
+  `retry_backoff_base_sec` (30) doubling to `retry_backoff_max_sec` (300), reset
+  to base on the next successful subscription. It previously slept out the
+  remainder of a 1 h window measured from the first failure of the streak, which
+  turned a ~30 s blip into a ~59 min outage for that camera.
 - `CameraConfig::id` and `mac` are populated from the UniFi Protect DB and used by
   the PostgreSQL backend to set `cameraId` and generate thumbnail IDs.
 - Detection mapping: ONVIF `"Human"` → `"person"`, `"Vehicle"` → `"vehicle"`.

@@ -705,6 +705,43 @@ static void test_reolink_ai_doorbell_classes(const std::string& jsonl) {
 // ============================================================
 // main
 // ============================================================
+
+// Reconnect backoff.  The old scheme slept out the remainder of a 1 h
+// "failure window" measured from the first failure in the streak, so three
+// failures at a 10 s retry interval (~30 s) produced a ~3570 s sleep -- a
+// brief blip cost an hour of blindness.  Observed on a live router as a
+// nightly 57-75 min all-camera outage.  The replacement doubles from a base
+// and clamps, so the worst case is bounded.
+static void test_backoff_doubles_and_clamps() {
+  const int base = 30, max = 300;
+
+  // First pause uses the base regardless of how we got here.
+  CHECK(onvif::next_backoff_sec(0, base, max) == base, "cold start -> base");
+  CHECK(onvif::next_backoff_sec(-5, base, max) == base, "negative -> base");
+  CHECK(onvif::next_backoff_sec(1, base, max) == base, "below base -> base");
+
+  // Doubling, then a hard ceiling -- never the old hour-long sleep.
+  CHECK(onvif::next_backoff_sec(30, base, max) == 60,  "30 -> 60");
+  CHECK(onvif::next_backoff_sec(60, base, max) == 120, "60 -> 120");
+  CHECK(onvif::next_backoff_sec(120, base, max) == 240, "120 -> 240");
+  CHECK(onvif::next_backoff_sec(240, base, max) == max, "240 clamps to max");
+  CHECK(onvif::next_backoff_sec(max, base, max) == max, "max is a fixed point");
+  CHECK(onvif::next_backoff_sec(99999, base, max) == max, "over max clamps");
+
+  // Degenerate config must not yield a zero-length or negative sleep.
+  CHECK(onvif::next_backoff_sec(0, 0, 0) >= 1, "zero config -> >=1s");
+  CHECK(onvif::next_backoff_sec(10, 60, 30) == 60, "max<base collapses to base");
+
+  // The whole point: bounded. Walk the ladder and assert the ceiling holds.
+  int b = onvif::next_backoff_sec(0, base, max);
+  for (int i = 0; i < 50; ++i) {
+    b = onvif::next_backoff_sec(b, base, max);
+    CHECK(b <= max, "backoff never exceeds max");
+    CHECK(b >= base, "backoff never drops below base");
+  }
+  CHECK(b == max, "ladder settles at max");
+}
+
 int main(int argc, char* argv[]) {
   if (argc < 19) {
     std::cerr << "Usage: " << argv[0] << "\n"
@@ -749,6 +786,8 @@ int main(int argc, char* argv[]) {
 
   onvif::global_init();
 
+  run_test("backoff_doubles_and_clamps",
+           [&] { test_backoff_doubles_and_clamps(); });
   run_test("hikvision_basic",
            [&] { test_hikvision_basic(hikvision_jsonl); });
   run_test("hot_add",

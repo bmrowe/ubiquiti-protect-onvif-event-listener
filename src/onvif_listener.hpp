@@ -123,10 +123,26 @@ struct CameraConfig {
     int retry_interval_sec{10};      ///< Seconds to wait before retrying a failed subscription
     ///< Pause and reset after this many consecutive failures (0 = unlimited)
     int max_consecutive_failures{0};
-    ///< After hitting max_consecutive_failures, wait this long before resetting
-    ///< the failure counter and retrying. Default: 3600 s (1 hour).
-    int failure_window_sec{3600};
+    ///< Backoff after a run of max_consecutive_failures failures.  Starts at
+    ///< base, doubles per consecutive pause, clamps at max, and resets to base
+    ///< the moment a subscription succeeds.
+    ///
+    ///< This used to sleep out the remainder of a 1 h "failure window" measured
+    ///< from the first failure in the streak.  With 3 failures at a 10 s retry
+    ///< interval the streak burned ~30 s, so every pause slept ~3570 s: a brief
+    ///< network blip cost a full hour of blindness on that camera.  Field-
+    ///< observed on the dev router as a nightly all-camera outage (57-75 min,
+    ///< two nights running) whenever the 04:17 backup, apt-daily and e2scrub
+    ///< overlapped and starved curl into timing out.
+    int retry_backoff_base_sec{30};
+    int retry_backoff_max_sec{300};
 };
+
+// Pure helper visible for testing.  Given the backoff just slept, return the
+// next one: double it, clamped to [base_sec, max_sec].  Degenerate input
+// (non-positive current or base, max below base) collapses to a sane value
+// rather than a zero-length or negative sleep.
+int next_backoff_sec(int current_sec, int base_sec, int max_sec);
 
 using EventCallback = std::function<void(const OnvifEvent&)>;
 

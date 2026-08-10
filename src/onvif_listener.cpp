@@ -30,6 +30,7 @@
 #include <zstd.h>
 
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -56,6 +57,17 @@
 #include "util.hpp"
 
 namespace onvif {
+
+int next_backoff_sec(int current_sec, int base_sec, int max_sec) {
+  if (base_sec < 1)       base_sec = 1;
+  if (max_sec  < base_sec) max_sec = base_sec;
+  if (current_sec < base_sec) return base_sec;
+  if (current_sec >= max_sec) return max_sec;
+  // Doubling can't overflow here: current_sec < max_sec <= INT_MAX/2 in any
+  // sane config, but clamp through int64 so a hand-edited max can't wrap.
+  const int64_t doubled = static_cast<int64_t>(current_sec) * 2;
+  return doubled >= max_sec ? max_sec : static_cast<int>(doubled);
+}
 
 // ============================================================
 // Library lifecycle
@@ -439,9 +451,9 @@ class CameraWorker {
   void run() {
     LOG(INFO) << '[' << cfg_.ip << "] started";
     const int max_failures = cfg_.max_consecutive_failures;  // 0 = unlimited
-    const int window_sec   = cfg_.failure_window_sec;
     int consecutive_failures = 0;
-    std::chrono::steady_clock::time_point streak_start;
+    int backoff_sec = next_backoff_sec(0, cfg_.retry_backoff_base_sec,
+                                       cfg_.retry_backoff_max_sec);
 
     while (running_) {
       // Discover event and alarm service URLs via GetServices (IncludeCapability=true).
@@ -450,11 +462,9 @@ class CameraWorker {
 
       auto sub_or = create_subscription(sv.event_url);
       if (!sub_or.ok()) {
-        if (consecutive_failures == 0)
-          streak_start = std::chrono::steady_clock::now();
         ++consecutive_failures;
         if (max_failures > 0 && consecutive_failures >= max_failures) {
-          pause_and_reset(&consecutive_failures, streak_start, window_sec,
+          pause_and_reset(&consecutive_failures, &backoff_sec,
               std::string("[") + cfg_.ip +
               "] camera unreachable after " +
               std::to_string(consecutive_failures) +
@@ -475,11 +485,9 @@ class CameraWorker {
 
       const Subscription& sub = *sub_or;
       if (sub.url.empty()) {
-        if (consecutive_failures == 0)
-          streak_start = std::chrono::steady_clock::now();
         ++consecutive_failures;
         if (max_failures > 0 && consecutive_failures >= max_failures) {
-          pause_and_reset(&consecutive_failures, streak_start, window_sec,
+          pause_and_reset(&consecutive_failures, &backoff_sec,
               std::string("[") + cfg_.ip +
               "] failed to get subscription URL after " +
               std::to_string(consecutive_failures) +
@@ -498,8 +506,10 @@ class CameraWorker {
         continue;
       }
 
-      // Successful subscription -- reset the failure counter.
+      // Successful subscription -- reset the failure counter and the backoff.
       consecutive_failures = 0;
+      backoff_sec = next_backoff_sec(0, cfg_.retry_backoff_base_sec,
+                                     cfg_.retry_backoff_max_sec);
       LOG(INFO) << '[' << cfg_.ip << "] subscription -> " << sub.url;
       subscribed_at_ms_.store(util::now_ms());
       last_renew_ms_.store(util::now_ms());
@@ -571,11 +581,9 @@ class CameraWorker {
         // backoff changes on its next refresh.
         publish_current_health();
         if (!ps.ok()) {
-          if (consecutive_failures == 0)
-            streak_start = std::chrono::steady_clock::now();
           ++consecutive_failures;
           if (max_failures > 0 && consecutive_failures >= max_failures) {
-            pause_and_reset(&consecutive_failures, streak_start, window_sec,
+            pause_and_reset(&consecutive_failures, &backoff_sec,
                 std::string("[") + cfg_.ip +
                 "] camera unreachable after " +
                 std::to_string(consecutive_failures) +
@@ -648,19 +656,15 @@ class CameraWorker {
     }
   }
 
-  // Log msg, sleep for the remainder of the failure window, then reset *failures.
-  void pause_and_reset(int* failures,
-                       const std::chrono::steady_clock::time_point& streak_start,
-                       int window_sec,
-                       const std::string& msg) {
-    using Clk = std::chrono::steady_clock;
-    auto deadline  = streak_start + std::chrono::seconds(window_sec);
-    auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
-                         deadline - Clk::now());
-    int pause_sec  = remaining.count() > 0
-                     ? static_cast<int>(remaining.count()) : 0;
-    LOG(WARNING) << msg << " (retry in " << pause_sec << "s)";
-    sleep_interruptible(pause_sec);
+  // Log msg, sleep for the current backoff, then double it (clamped) and
+  // reset *failures so the next attempt starts a fresh streak.  The caller
+  // resets *backoff_sec to the base on a successful subscription.
+  void pause_and_reset(int* failures, int* backoff_sec, const std::string& msg) {
+    LOG(WARNING) << msg << " (retry in " << *backoff_sec << "s)";
+    sleep_interruptible(*backoff_sec);
+    *backoff_sec = next_backoff_sec(*backoff_sec,
+                                    cfg_.retry_backoff_base_sec,
+                                    cfg_.retry_backoff_max_sec);
     *failures = 0;
   }
 
