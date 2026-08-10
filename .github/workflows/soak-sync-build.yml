@@ -1,7 +1,7 @@
 name: Soak sync + build
 
-# Keeps a `soak` branch = danielwoz/main + our Reolink fix, rebuilt daily,
-# and publishes the arm64 .deb to a rolling `soak-latest` prerelease.
+# Keeps a `soak` branch = danielwoz/main + our not-yet-upstream fixes, rebuilt
+# daily, and publishes the arm64 .deb to a rolling `soak-latest` prerelease.
 #
 # Design notes:
 #   * Runs from the fork's DEFAULT branch (GitHub only schedules workflows
@@ -10,10 +10,19 @@ name: Soak sync + build
 #   * "Our fixes" are derived from the PR branches (${PATCH_BRANCHES}) as the
 #     commits unique to each vs its merge-base with upstream, replayed in the
 #     listed order. Robust across rebases.
-#   * A rebase/cherry-pick conflict never pushes a broken tree — it opens (or
-#     comments on) a tracking issue and fails the run for a human.
+#   * A rebase/cherry-pick conflict never pushes a broken tree — it writes a
+#     job summary + error annotation and fails the run for a human. (It used
+#     to open a tracking issue; Issues are disabled on this fork, so that
+#     step failed silently and the only signal was a bare red X.)
 #   * The rolling `soak-latest` release keeps a fixed-name asset
 #     (onvif-recorder_soak_arm64.deb) so the UNVR always has the same URL.
+#
+# Retiring a branch from PATCH_BRANCHES: upstream lands some contributions by
+# hand rather than by merging the PR, so a patch can be fully absorbed while
+# its PR stays open and its patch-id no longer matches anything. There is no
+# reliable automatic signal for that — `git cherry` and reverse-applying the
+# diff both fail once upstream reworks the code. When a branch starts
+# conflicting, check whether the change is already upstream before resolving.
 
 on:
   schedule:
@@ -22,7 +31,6 @@ on:
 
 permissions:
   contents: write            # push soak branch, manage the release
-  issues: write              # open the conflict tracking issue
 
 concurrency:
   group: soak-sync-build
@@ -33,8 +41,12 @@ env:
   # Space-separated, applied in order. Each is a branch whose commits unique
   # to it (vs its merge-base with upstream) get replayed onto the soak branch.
   # Keep them single-purpose so each can be sent upstream as its own PR.
+  #
+  # Retired: fix/reolink-pet-and-drop-unclassified-motion. --drop_unclassified_motion
+  # is upstream as of v1.6.24 (50fbbea, taken from PR #44 by hand, then fixed in
+  # dae2f46 — upstream's copy is the better one). The branch itself is NOT deleted:
+  # PR #44 is still open and that branch is its head.
   PATCH_BRANCHES: >-
-    fix/reolink-pet-and-drop-unclassified-motion
     fix/ship-apt-keyring
   SOAK_BRANCH: soak
   RELEASE_TAG: soak-latest
@@ -117,29 +129,39 @@ jobs:
           done
           git push -f origin "$SOAK_BRANCH"
 
-      - name: Open/append conflict tracking issue
+      # Issues are disabled on this fork, so the old `gh issue create` here
+      # failed with "repository has disabled issues" and the conflict went
+      # unreported. A job summary + annotation always works and needs no token.
+      - name: Report conflict
         if: failure() && steps.rebase.outputs.conflict == '1'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.rebase.outputs.conflict_branch }}
+          FILES: ${{ steps.rebase.outputs.conflict_files }}
+          UPSTREAM_SHA: ${{ steps.fetch.outputs.upstream_sha }}
         run: |
-          TITLE="⚠️ Soak sync: our fix no longer rebases onto upstream/main"
-          BODY="The daily soak sync could not replay \`${{ steps.rebase.outputs.conflict_branch }}\` onto \`upstream/main\` (\`${{ steps.fetch.outputs.upstream_sha }}\`).
-
-          **Conflicting files:** ${{ steps.rebase.outputs.conflict_files }}
-
-          Resolve locally:
-          \`\`\`
-          git fetch origin && git fetch upstream main
-          git rebase upstream/main ${{ steps.rebase.outputs.conflict_branch }}   # fix conflicts, then push --force-with-lease
-          \`\`\`
-          The soak build is paused until this is resolved."
-          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$TITLE in:title" --json number -q '.[0].number')
-          if [ -n "$EXISTING" ]; then
-            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "$BODY"
-          else
-            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY" --label "soak-sync" 2>/dev/null \
-              || gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY"
-          fi
+          {
+            echo "## ⚠️ Soak sync: \`$BRANCH\` no longer replays onto upstream/main"
+            echo
+            echo "Upstream \`main\` is at \`$UPSTREAM_SHA\`."
+            echo
+            echo "**Conflicting files:** $FILES"
+            echo
+            echo "**Check first whether upstream has already absorbed this patch.**"
+            echo "Upstream lands some contributions by hand rather than by merging the"
+            echo "PR, so the change can be in \`main\` while the PR is still open and the"
+            echo "patch-id no longer matches. If so, retire the branch from"
+            echo "\`PATCH_BRANCHES\` rather than resolving the conflict."
+            echo
+            echo "Otherwise, rebase it:"
+            echo
+            echo '```'
+            echo "git fetch origin && git fetch upstream main"
+            echo "git rebase upstream/main $BRANCH   # then push --force-with-lease"
+            echo '```'
+            echo
+            echo "The soak build is paused until this is resolved."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=Soak sync conflict::$BRANCH no longer replays onto upstream/main (conflicting files: $FILES). See the job summary."
 
       # ---- Build (mirrors .github/workflows/release-deb.yml) ----
       - name: Init required submodules
@@ -220,7 +242,7 @@ jobs:
             --target "$SOAK_BRANCH" \
             --prerelease \
             --title "Soak build ${{ steps.ver.outputs.version }}" \
-            --notes "Rolling soak build: danielwoz/main (\`${{ steps.fetch.outputs.upstream_sha }}\`) + our Reolink pet fix / --drop_unclassified_motion, rebuilt $(date -u +%Y-%m-%dT%H:%MZ).
+            --notes "Rolling soak build: danielwoz/main (\`${{ steps.fetch.outputs.upstream_sha }}\`) + \`$PATCH_BRANCHES\`, rebuilt $(date -u +%Y-%m-%dT%H:%MZ).
 
           Install on the UNVR (stable URL):
           \`\`\`
