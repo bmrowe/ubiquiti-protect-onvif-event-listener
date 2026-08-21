@@ -1,0 +1,56 @@
+name: CI
+
+# Build + test on native x86 Linux runners (fast — no emulation), and produce a
+# downloadable ARM64 .deb artifact so the package can be built without a local
+# cross-compile.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # Full history + tags so build-deb.sh's `git describe` derives a
+          # real version instead of 0.0.0-dev.
+          fetch-depth: 0
+
+      - name: Install build toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang cmake ninja-build perl lld nasm \
+            python3-pip curl git dpkg-dev fakeroot xz-utils \
+            binutils-aarch64-linux-gnu autoconf automake libtool pkg-config m4
+          sudo curl -fsSL -o /usr/local/bin/bazel \
+            https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64
+          sudo chmod +x /usr/local/bin/bazel
+
+      - name: Cache Bazel
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel
+          key: bazel-${{ runner.os }}-${{ hashFiles('MODULE.bazel.lock', 'WORKSPACE', '.bazelversion') }}
+          restore-keys: |
+            bazel-${{ runner.os }}-
+
+      - name: Run tests (x86, native)
+        run: scripts/bz test --config=x86 //test:all --test_output=errors
+
+      - name: Build ARM64 release binary (PGO + ThinLTO)
+        run: scripts/bz build --config=arm64_release //:onvif_recorder
+
+      - name: Assemble ARM64 .deb
+        run: scripts/build-deb.sh --arch=arm64
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: onvif-recorder-deb
+          path: dist/*.deb
+          if-no-files-found: error
