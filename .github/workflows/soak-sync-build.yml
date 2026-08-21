@@ -1,0 +1,288 @@
+name: Sync main + build
+
+# Rebuilds `main` = danielwoz/main + our not-yet-upstream patches, daily, and
+# publishes the arm64 .deb to a rolling `soak-latest` prerelease.
+#
+# Topology (this fork has ONE mainline):
+#
+#     main = upstream/main + ci/soak-automation + <fix branches>
+#
+#   `main` is bot-owned and force-pushed by this workflow. It is not a place to
+#   commit: it is a build product, and it is exactly what runs on the UNVR.
+#   Real work goes on single-purpose patch branches listed in PATCH_BRANCHES,
+#   each of which can be sent upstream as its own PR.
+#
+# Design notes:
+#   * GitHub only schedules workflows from the DEFAULT branch, so this file has
+#     to exist at main's HEAD. It gets there the same way every other fork-local
+#     change does — by being replayed from a patch branch (ci/soak-automation).
+#     That is why the automation lists itself in PATCH_BRANCHES. Edit this file
+#     on ci/soak-automation, never on main; a commit made directly on main is
+#     erased by the next run. (The cron itself is now commented out — see the
+#     `on:` block — but this still holds: workflow_dispatch is only offered for
+#     files present on the default branch.)
+#   * The push is guarded: if the rebuilt tree somehow lacks this workflow, the
+#     run fails instead of pushing. Without that, one bad PATCH_BRANCHES edit
+#     would orphan the automation and it would die with no signal.
+#   * "Our patches" are derived as the commits unique to each branch vs its
+#     merge-base with upstream, replayed in the listed order. Robust across
+#     rebases.
+#   * A cherry-pick conflict never pushes a broken tree — it writes a job
+#     summary + error annotation and fails the run for a human. (It used to open
+#     a tracking issue; Issues are disabled on this fork, so that step failed
+#     silently and the only signal was a bare red X.)
+#   * The rolling `soak-latest` release keeps a fixed-name asset
+#     (onvif-recorder_soak_arm64.deb) so the UNVR always has the same URL.
+#     Do not rename the tag or the asset — the box's install command hardcodes
+#     both.
+#
+# Retiring a branch from PATCH_BRANCHES: upstream lands some contributions by
+# hand rather than by merging the PR, so a patch can be fully absorbed while
+# its PR stays open and its patch-id no longer matches anything. There is no
+# reliable automatic signal for that — `git cherry` and reverse-applying the
+# diff both fail once upstream reworks the code. When a branch starts
+# conflicting, check whether the change is already upstream before resolving.
+
+on:
+  # Manual only. The daily cron was removed 2026-09-01: upstream's own CI
+  # (added in #49) covers build+test, this fork carries a single packaging
+  # patch, and a scheduled rebuild mostly produced red mail for upstream
+  # workflow-file churn that never touches runtime code. Press "Run workflow"
+  # when you actually want a fresh soak .deb.
+  #   schedule:
+  #     - cron: '17 11 * * *'   # 11:17 UTC daily (~early morning US)
+  workflow_dispatch: {}      # manual "sync now" from the Actions tab
+
+permissions:
+  contents: write            # force-push main, manage the release
+
+concurrency:
+  group: soak-sync-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/danielwoz/ubiquiti-protect-onvif-event-listener.git
+  # Space-separated, applied in order. Each is a branch whose commits unique
+  # to it (vs its merge-base with upstream) get replayed onto TARGET_BRANCH.
+  # Keep them single-purpose so each can be sent upstream as its own PR.
+  #
+  # ci/soak-automation carries this workflow and MUST stay first — see the
+  # design notes above.
+  #
+  # Retired: fix/reolink-pet-and-drop-unclassified-motion. --drop_unclassified_motion
+  # is upstream as of v1.6.24 (50fbbea, taken from PR #44 by hand, then fixed in
+  # dae2f46 — upstream's copy is the better one). The branch itself is NOT deleted:
+  # PR #44 is still open and that branch is its head.
+  PATCH_BRANCHES: >-
+    ci/soak-automation
+    fix/ship-apt-keyring
+  TARGET_BRANCH: main
+  SELF_PATH: .github/workflows/soak-sync-build.yml
+  RELEASE_TAG: soak-latest
+  ASSET_STABLE: onvif-recorder_soak_arm64.deb
+
+jobs:
+  sync-and-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "onvif-soak-bot"
+          git config user.email "noreply@github.com"
+
+      - name: Fetch upstream + patch branches
+        id: fetch
+        run: |
+          git remote add upstream "$UPSTREAM"
+          git fetch --tags upstream main
+          for b in $PATCH_BRANCHES; do
+            git fetch origin "$b"
+          done
+          git fetch origin "$TARGET_BRANCH"
+          echo "upstream_sha=$(git rev-parse upstream/main)" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if no new upstream commits
+        id: guard
+        run: |
+          UP=$(git rev-parse upstream/main)
+          BUILD=yes
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] \
+             && git rev-parse -q --verify origin/$TARGET_BRANCH >/dev/null; then
+            BASE_BUILT=$(git merge-base origin/$TARGET_BRANCH upstream/main)
+            if [ "$BASE_BUILT" = "$UP" ]; then
+              echo "No new upstream commits since last build."
+              BUILD=no
+              # Upstream is unchanged, but one of our own patch branches may
+              # have gained a commit (or been amended). `git cherry` marks
+              # with '+' any commit whose patch-id isn't already on main;
+              # without this check a new local fix would sit unbuilt until
+              # upstream happened to move.
+              for b in $PATCH_BRANCHES; do
+                PB=$(git merge-base upstream/main "origin/$b")
+                if git cherry "origin/$TARGET_BRANCH" "origin/$b" "$PB" \
+                     | grep -q '^+'; then
+                  echo "Patch branch $b has commits not on main — rebuilding."
+                  BUILD=yes
+                fi
+              done
+            fi
+          fi
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+
+      - name: Rebuild main = upstream/main + our patches
+        id: rebase
+        if: steps.guard.outputs.build == 'yes'
+        run: |
+          set -e
+          git checkout -B "$TARGET_BRANCH" upstream/main
+          for b in $PATCH_BRANCHES; do
+            PATCH_BASE=$(git merge-base upstream/main "origin/$b")
+            N=$(git rev-list --count "$PATCH_BASE..origin/$b")
+            echo "Cherry-picking $N commit(s) from $b"
+            # NB: `[ … ] && continue` would abort the whole step under
+            # `set -e` when N != 0, since the && list returns non-zero.
+            if [ "$N" -eq 0 ]; then continue; fi
+            if ! git cherry-pick "$PATCH_BASE..origin/$b"; then
+              CONFLICTS=$(git diff --name-only --diff-filter=U | paste -sd', ' -)
+              git cherry-pick --abort || true
+              echo "conflict=1" >> "$GITHUB_OUTPUT"
+              echo "conflict_branch=$b" >> "$GITHUB_OUTPUT"
+              echo "conflict_files=$CONFLICTS" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+          done
+          # The schedule is read from main's HEAD. Never push a main that
+          # cannot re-run this workflow.
+          if [ ! -f "$SELF_PATH" ]; then
+            echo "::error title=Refusing to push::$SELF_PATH is missing from the rebuilt tree — pushing would orphan the daily schedule. Check that ci/soak-automation is still in PATCH_BRANCHES."
+            exit 1
+          fi
+          git push -f origin "$TARGET_BRANCH"
+
+      # Issues are disabled on this fork, so the old `gh issue create` here
+      # failed with "repository has disabled issues" and the conflict went
+      # unreported. A job summary + annotation always works and needs no token.
+      - name: Report conflict
+        if: failure() && steps.rebase.outputs.conflict == '1'
+        env:
+          BRANCH: ${{ steps.rebase.outputs.conflict_branch }}
+          FILES: ${{ steps.rebase.outputs.conflict_files }}
+          UPSTREAM_SHA: ${{ steps.fetch.outputs.upstream_sha }}
+        run: |
+          {
+            echo "## ⚠️ Sync: \`$BRANCH\` no longer replays onto upstream/main"
+            echo
+            echo "Upstream \`main\` is at \`$UPSTREAM_SHA\`."
+            echo
+            echo "**Conflicting files:** $FILES"
+            echo
+            echo "**Check first whether upstream has already absorbed this patch.**"
+            echo "Upstream lands some contributions by hand rather than by merging the"
+            echo "PR, so the change can be in \`main\` while the PR is still open and the"
+            echo "patch-id no longer matches. If so, retire the branch from"
+            echo "\`PATCH_BRANCHES\` rather than resolving the conflict."
+            echo
+            echo "Otherwise, rebase it:"
+            echo
+            echo '```'
+            echo "git fetch origin && git fetch upstream main"
+            echo "git rebase upstream/main $BRANCH   # then push --force-with-lease"
+            echo '```'
+            echo
+            echo "\`main\` is left at its previous commit until this is resolved."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=Sync conflict::$BRANCH no longer replays onto upstream/main (conflicting files: $FILES). See the job summary."
+
+      # ---- Build (mirrors .github/workflows/release-deb.yml) ----
+      - name: Init required submodules
+        if: steps.guard.outputs.build == 'yes'
+        run: |
+          git submodule update --init --depth 1 \
+              third_party/zstd \
+              third_party/gperftools
+
+      - name: Install system deps
+        if: steps.guard.outputs.build == 'yes'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang cmake ninja-build perl lld nasm \
+            python3-pip curl git dpkg-dev fakeroot xz-utils qemu-user-static \
+            binutils-aarch64-linux-gnu reprepro gnupg lintian \
+            autoconf automake libtool pkg-config m4
+          pip3 install --break-system-packages cpplint
+
+      - name: Install Bazel
+        if: steps.guard.outputs.build == 'yes'
+        run: |
+          sudo curl -fsSL -o /usr/local/bin/bazel \
+            https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64
+          sudo chmod +x /usr/local/bin/bazel
+
+      - name: Fetch NanoDet-M model files
+        if: steps.guard.outputs.build == 'yes'
+        run: |
+          curl -fL -o nanodet_m.param \
+            https://github.com/nihui/ncnn-assets/raw/refs/heads/master/models/nanodet_m.param
+          curl -fL -o nanodet_m.bin \
+            https://github.com/nihui/ncnn-assets/raw/refs/heads/master/models/nanodet_m.bin
+
+      - name: Compute soak version
+        if: steps.guard.outputs.build == 'yes'
+        id: ver
+        run: |
+          BASE=$(git describe --tags --abbrev=0 upstream/main | sed 's/^v//')
+          VERSION="${BASE}+soak.$(date -u +%Y%m%d%H%M).g$(git rev-parse --short HEAD)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building soak version: $VERSION"
+
+      - name: Build ARM64 release binary
+        if: steps.guard.outputs.build == 'yes'
+        run: |
+          scripts/bz build --config=arm64_release //:onvif_recorder
+          cp ~/.cache/bazel/arm64_release/execroot/_main/bazel-out/k8-fastbuild/bin/onvif_recorder \
+             onvif_recorder_arm64
+
+      - name: Build .deb
+        if: steps.guard.outputs.build == 'yes'
+        run: |
+          scripts/build-deb.sh --arch=arm64 \
+            --binary=onvif_recorder_arm64 \
+            --version=${{ steps.ver.outputs.version }}
+          cp dist/onvif-recorder_${{ steps.ver.outputs.version }}_arm64.deb "dist/$ASSET_STABLE"
+
+      - name: Lint .deb
+        if: steps.guard.outputs.build == 'yes'
+        run: |
+          lintian --fail-on error --no-tag-display-limit \
+            dist/onvif-recorder_${{ steps.ver.outputs.version }}_arm64.deb || true
+
+      - name: Publish rolling soak-latest prerelease
+        if: steps.guard.outputs.build == 'yes'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Point the moving tag at the freshly built commit and recreate
+          # the release so notes + assets are current.
+          git tag -f "$RELEASE_TAG" "$TARGET_BRANCH"
+          git push -f origin "refs/tags/$RELEASE_TAG"
+          gh release delete "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$TARGET_BRANCH" \
+            --prerelease \
+            --title "Soak build ${{ steps.ver.outputs.version }}" \
+            --notes "Rolling soak build: danielwoz/main (\`${{ steps.fetch.outputs.upstream_sha }}\`) + \`$PATCH_BRANCHES\`, rebuilt $(date -u +%Y-%m-%dT%H:%MZ).
+
+          Install on the UNVR (stable URL):
+          \`\`\`
+          curl -fL -o /tmp/soak.deb https://github.com/${{ github.repository }}/releases/download/$RELEASE_TAG/$ASSET_STABLE
+          dpkg -i /tmp/soak.deb
+          \`\`\`" \
+            "dist/$ASSET_STABLE" \
+            "dist/onvif-recorder_${{ steps.ver.outputs.version }}_arm64.deb"
