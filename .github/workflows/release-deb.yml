@@ -27,11 +27,12 @@ jobs:
       # available as prebuilt arm64 sysroot packages.  curl / libxml2
       # / openssl / libjpeg-turbo come from @arm64_sysroot, but
       # zstd and gperftools (tcmalloc) are always built from source.
-      - name: Init required submodules
-        run: |
-          git submodule update --init --depth 1 \
-              third_party/zstd \
-              third_party/gperftools
+      # The arm64 build itself only needs zstd + gperftools (curl, libxml2,
+      # openssl and libjpeg-turbo come from @arm64_sysroot), but the x86
+      # test gate below builds all of them from source via
+      # new_local_repository, so every submodule has to be present.
+      - name: Init submodules
+        run: git submodule update --init --depth 1
 
       - name: Install system deps
         run: |
@@ -42,6 +43,9 @@ jobs:
             binutils-aarch64-linux-gnu reprepro gnupg lintian \
             autoconf automake libtool pkg-config m4
           pip3 install --break-system-packages cpplint
+
+      - name: cpplint
+        run: python3 -m cpplint src/*.cpp src/*.hpp test/*.cpp test/*.hpp
 
       - name: Install Bazel
         run: |
@@ -55,6 +59,14 @@ jobs:
             https://github.com/nihui/ncnn-assets/raw/refs/heads/master/models/nanodet_m.param
           curl -fL -o nanodet_m.bin \
             https://github.com/nihui/ncnn-assets/raw/refs/heads/master/models/nanodet_m.bin
+
+      # Release gate.  Nothing is built, uploaded or published to the apt
+      # repo unless the suite is green first -- a tag must not be able to
+      # ship code that fails its own tests.  Runs on x86 because that is
+      # where the tests execute; the arm64 binary below is the same sources.
+      - name: Test before releasing
+        run: |
+          scripts/bz test --config=x86 --test_output=errors //test:all
 
       - name: Compute version
         id: ver
